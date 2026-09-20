@@ -320,7 +320,16 @@ class LazyTensor(torch.Tensor):
                         # for early materialized tensor, use its materialized data directly
                         return x._materialized_data if is_change_meta_op else x._materialized_data.data
                     t = x if is_inplace else x.clone()
-                    if func.__name__ not in _NO_RERUN_OPS:
+                    # An inplace op only modifies its first operand. Recording it on the other lazy
+                    # operands as well leaves a spurious back edge on them -- their buffer holds an op
+                    # whose real self is ``args[0]``. Then materializing either side of a two-lazy-operand
+                    # inplace op bounces between the two forever, because both buffers replay the same op
+                    # and ``_materialized_data`` is only assigned after ``_rerun_ops`` returns.
+                    # Keep the record on ``args[0]`` only; when the first operand is not a tensor (or
+                    # there is none) the operands cannot be told apart, so fall back to recording on all.
+                    primary = args[0] if is_inplace and len(args) > 0 else None
+                    is_recorded = not is_inplace or not isinstance(primary, Tensor) or x is primary
+                    if is_recorded and func.__name__ not in _NO_RERUN_OPS:
                         t._op_buffer.append((func, args, kwargs))
                     meta = x._meta_data if is_change_meta_op else x._meta_data.data
                     meta_to_lazy[meta] = t
@@ -538,7 +547,24 @@ class LazyInitContext:
                         f"new() received an invalid combination of arguments - got {tuple(type(x) for x in args)}, but expected one of:\n * (Tensor other)\n * (tuple of ints size, *, torch.device device)\n * (object data, *, torch.device device)"
                     )
 
-            return wrapper, target
+            # ``torch.LongTensor`` and friends are plain classes (``torch.tensortype``) upstream, and
+            # transformers v5 annotates with them in unions that are evaluated at runtime
+            # (``input_ids: torch.LongTensor | None``: 4877 matching lines in the v5.17.0 tree
+            # (``grep -rF --include=*.py``), while attribute access like ``torch.LongTensor.dtype``
+            # occurs 0 times). Swapping in a bare
+            # function therefore breaks the import of any modeling module first loaded inside the
+            # context, with ``TypeError: unsupported operand type(s) for |: 'function' and 'NoneType'``.
+            # Wrapping the callable in a class keeps both uses working: it stays a type for ``|`` and
+            # still constructs a lazy tensor when called.
+            class _LegacyConstructor:
+                def __new__(cls, *args, **kwargs):
+                    return wrapper(*args, **kwargs)
+
+            # ``target`` here is the tensor *type object* (its second half is handed to ``setattr`` on
+            # exit), so take the display name off it rather than assuming a string.
+            _LegacyConstructor.__name__ = getattr(target, "__name__", "Tensor").rsplit(".", 1)[-1]
+            _LegacyConstructor.__qualname__ = _LegacyConstructor.__name__
+            return _LegacyConstructor, target
 
         def wrap_no_meta_factory(target):
             # factory functions which don't support meta tensor backend
@@ -578,6 +604,10 @@ class LazyInitContext:
             }
         )
 
+        # ``wrap_legacy_constructor``'s wrapper looks this up lazily, through ``self``, when the
+        # legacy constructor is actually called -- the mapping has to exist by then, and it only
+        # materializes here, after the wrappers themselves are built.
+        self.overrides = overrides
         ConstructorManager.apply(overrides)
         PretrainedManager.inject()
 
