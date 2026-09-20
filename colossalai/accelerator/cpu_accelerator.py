@@ -103,7 +103,11 @@ class CpuAccelerator(BaseAccelerator):
         """
         Returns the random number generator state of the specified GPU as a ByteTensor.
         """
-        return torch.get_rng_state(device)
+        # ``torch.get_rng_state`` no longer takes ``device`` (torch 2.11: ``() -> Tensor``), so
+        # forwarding it raises ``TypeError``. This is the only call site in the repo that passed
+        # it -- the other 14 call ``torch.get_rng_state()`` with no argument. The parameter is kept
+        # on the signature for API parity; the state returned is the CPU generator's either way.
+        return torch.get_rng_state()
 
     def get_rng_state_all(self) -> List[torch.Tensor]:
         """

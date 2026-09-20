@@ -1,3 +1,4 @@
+import inspect
 import warnings
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -18,12 +19,20 @@ from transformers.models.mixtral.modeling_mixtral import (
     MoeModelOutputWithPast,
     apply_rotary_pos_emb,
     load_balancing_loss_func,
+    repeat_kv,
 )
 from transformers.utils import is_flash_attn_2_available, logging
 
 from colossalai.lazy import LazyInitContext
-from colossalai.moe._operation import EPGradScalerIn, EPGradScalerOut, all_to_all_uneven
+from colossalai.moe._operation import (
+    DPGradScalerIn,
+    DPGradScalerOut,
+    EPGradScalerIn,
+    EPGradScalerOut,
+    all_to_all_uneven,
+)
 from colossalai.pipeline.stage_manager import PipelineStageManager
+from colossalai.quantization.fp8 import all_reduce_fp8
 from colossalai.shardformer.layer._operation import (
     all_to_all_comm,
     gather_forward_split_backward,
@@ -33,6 +42,13 @@ from colossalai.shardformer.layer.linear import Linear1D_Col, Linear1D_Row, Para
 from colossalai.shardformer.shard import ShardConfig
 from colossalai.shardformer.shard.utils import set_tensors_to_none
 from colossalai.tensor.moe_tensor.api import set_moe_tensor_ep_group
+
+if is_flash_attn_2_available():
+    from flash_attn import flash_attn_func
+
+    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+
+    _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
 
 
 class EPMixtralSparseMoeBlock(ParallelModule):
@@ -125,6 +141,17 @@ class EPMixtralSparseMoeBlock(ParallelModule):
 
         dist.all_to_all_single(output_split_sizes, input_split_sizes, group=self.ep_group)
 
+        with torch.no_grad():
+            activate_experts = output_split_sizes[: self.num_experts_per_ep].clone()
+            for i in range(1, self.ep_size):
+                activate_experts += output_split_sizes[i * self.num_experts_per_ep : (i + 1) * self.num_experts_per_ep]
+            activate_experts = (activate_experts > 0).float()
+
+        if self.fp8_communication:
+            all_reduce_fp8(activate_experts, group=self.moe_dp_group)
+        else:
+            dist.all_reduce(activate_experts, group=self.moe_dp_group)
+
         input_split_list = input_split_sizes.view(self.ep_size, self.num_experts_per_ep).sum(dim=-1).tolist()
         output_split_list = output_split_sizes.view(self.ep_size, self.num_experts_per_ep).sum(dim=-1).tolist()
 
@@ -141,8 +168,10 @@ class EPMixtralSparseMoeBlock(ParallelModule):
             if self.num_experts_per_ep == 1:
                 # no need to split
                 expert = self.experts[self.expert_start_idx]
+                output_states = DPGradScalerIn.apply(output_states, self.moe_dp_size, activate_experts[0])
                 output_states = expert.act_fn(expert.w1(output_states)) * expert.w3(output_states)
                 output_states = expert.w2(output_states)
+                output_states = DPGradScalerOut.apply(output_states, self.moe_dp_size, activate_experts[0])
             else:
                 output_states_splits = output_states.split(output_split_sizes.tolist())
                 output_states_list = []
@@ -150,8 +179,14 @@ class EPMixtralSparseMoeBlock(ParallelModule):
                     if split_states.size(0) == 0:
                         continue
                     expert = self.experts[self.expert_start_idx + i % self.num_experts_per_ep]
+                    split_states = DPGradScalerIn.apply(
+                        split_states, self.moe_dp_size, activate_experts[i % self.num_experts_per_ep]
+                    )
                     split_states = expert.act_fn(expert.w1(split_states)) * expert.w3(split_states)
                     split_states = expert.w2(split_states)
+                    split_states = DPGradScalerOut.apply(
+                        split_states, self.moe_dp_size, activate_experts[i % self.num_experts_per_ep]
+                    )
                     output_states_list.append(split_states)
                 output_states = torch.cat(output_states_list)
 
@@ -600,12 +635,19 @@ def get_mixtral_flash_attention_forward(shard_config, sp_mode=None, sp_size=None
 
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
+        if not _flash_supports_window_size:
+            logger.warning_once(
+                "The current flash attention version does not support sliding window attention, for a more memory efficient implementation"
+                " make sure to upgrade flash-attn library."
+            )
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        # Transformers attention interfaces handle grouped-query heads and
-        # receive tensors in [batch, heads, sequence, head_dim] order.
+        # repeat k/v heads if n_kv_heads < n_heads
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        0.0 if not self.training else self.attention_dropout
 
         # In PEFT, usually we cast the layer norms in float32 for training stability reasons
         # therefore the input hidden states gets silently casted in float32. Hence, we need
@@ -629,6 +671,11 @@ def get_mixtral_flash_attention_forward(shard_config, sp_mode=None, sp_size=None
             query_states = query_states.to(target_dtype)
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
+        # Reashape to the expected shape for Flash Attention
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
@@ -658,7 +705,7 @@ def get_mixtral_flash_attention_forward(shard_config, sp_mode=None, sp_size=None
                 attn_output, sp_group, scatter_dim=1, gather_dim=2, fp8_communication=shard_config.fp8_communication
             )  # (1, 4, 256)
         else:
-            attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
         attn_output = self.o_proj(attn_output)
 
@@ -733,7 +780,7 @@ def get_mixtral_flash_attention_model_forward(shard_config, sp_mode=None, sp_siz
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if attention_mask is not None and self.config._attn_implementation == "flash_attention_2" and use_cache:
+        if attention_mask is not None and self._attn_implementation == "flash_attention_2" and use_cache:
             is_padding_right = attention_mask[:, -1].sum().item() != batch_size
             if is_padding_right:
                 raise ValueError(
@@ -744,7 +791,7 @@ def get_mixtral_flash_attention_model_forward(shard_config, sp_mode=None, sp_siz
         if self.config._attn_implementation == "flash_attention_2":
             # 2d mask is passed through the layers
             attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-        elif self.config._attn_implementation == "sdpa" and not output_attentions:
+        elif self._attn_implementation == "sdpa" and not output_attentions:
             # output_attentions=True can not be supported when using SDPA, and we fall back on
             # the manual implementation that requires a 4D causal mask in all cases.
             attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
