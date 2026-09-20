@@ -38,24 +38,22 @@ def new_from_pretrained(
 ) -> Module:
     from transformers import GenerationConfig
     from transformers.configuration_utils import PretrainedConfig
-    from transformers.modeling_utils import (
-        ContextManagers,
-        _add_variant,
-        cached_file,
-        download_url,
-        has_file,
-        is_offline_mode,
+    from transformers.modeling_utils import ContextManagers, _add_variant, cached_file, has_file, is_offline_mode
+    from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME, logging
+
+    from colossalai._compat import (
+        auth_kwargs,
+        get_download_url,
+        get_no_init_weights,
         is_remote_url,
-        no_init_weights,
-    )
-    from transformers.utils import (
-        SAFE_WEIGHTS_INDEX_NAME,
-        SAFE_WEIGHTS_NAME,
-        WEIGHTS_INDEX_NAME,
-        WEIGHTS_NAME,
         is_safetensors_available,
-        logging,
     )
+
+    # transformers v5 兼容层（详见 colossalai/_compat.py）：
+    #   no_init_weights  v5 搬到 transformers.initialization —— 取回后下方调用点写法不变
+    #   download_url     v5 已整体删除 —— 取回 None，由下方裸 URL 分支显式处理
+    no_init_weights = get_no_init_weights()
+    download_url = get_download_url()
 
     logger = logging.get_logger(__name__)
 
@@ -64,7 +62,12 @@ def new_from_pretrained(
     force_download = kwargs.pop("force_download", False)
     proxies = kwargs.pop("proxies", None)
     local_files_only = kwargs.pop("local_files_only", False)
+    # 认证参数：v4 名 `use_auth_token`，v5 改名 `token`（见 colossalai/_compat.py）。
+    # 两个名字都收，否则用户在 v5 下传 `token=` 会与本函数下方显式传的同名参数冲突
+    # （`got multiple values for keyword argument 'token'`）。
     use_auth_token = kwargs.pop("use_auth_token", None)
+    if use_auth_token is None:
+        use_auth_token = kwargs.pop("token", None)
     revision = kwargs.pop("revision", None)
     _ = kwargs.pop("mirror", None)
     from_pipeline = kwargs.pop("_from_pipeline", None)
@@ -117,7 +120,7 @@ def new_from_pretrained(
             force_download=force_download,
             proxies=proxies,
             local_files_only=local_files_only,
-            use_auth_token=use_auth_token,
+            **auth_kwargs(use_auth_token),
             revision=revision,
             subfolder=subfolder,
             _from_auto=from_auto_class,
@@ -178,6 +181,16 @@ def new_from_pretrained(
             archive_file = pretrained_model_name_or_path
             is_local = True
         elif is_remote_url(pretrained_model_name_or_path):
+            if download_url is None:
+                # transformers v5 移除了裸 URL 加载：download_url / is_remote_url 在 v5
+                # 安装树里 0 处残留，cached_file 也不再接受 URL。这里对齐 v5 的能力边界
+                # 并给出解释性报错；不静默落到 else 分支（那会拿 repo id 去缓存里找，
+                # 用户只看到一个看不出真实原因的 OSError）。
+                raise NotImplementedError(
+                    "transformers v5 不再支持从裸 URL 加载权重，收到 "
+                    f"{pretrained_model_name_or_path!r}。请先把权重下载到本地目录后传入该目录，"
+                    "或改用 HuggingFace repo id。"
+                )
             filename = pretrained_model_name_or_path
             resolved_archive_file = download_url(pretrained_model_name_or_path)
         else:
@@ -194,7 +207,7 @@ def new_from_pretrained(
                     "force_download": force_download,
                     "proxies": proxies,
                     "local_files_only": local_files_only,
-                    "use_auth_token": use_auth_token,
+                    **auth_kwargs(use_auth_token),
                     "user_agent": user_agent,
                     "revision": revision,
                     "subfolder": subfolder,
@@ -239,7 +252,7 @@ def new_from_pretrained(
                     has_file_kwargs = {
                         "revision": revision,
                         "proxies": proxies,
-                        "use_auth_token": use_auth_token,
+                        **auth_kwargs(use_auth_token),
                     }
                     if variant is not None and has_file(pretrained_model_name_or_path, WEIGHTS_NAME, **has_file_kwargs):
                         raise EnvironmentError(
@@ -311,7 +324,7 @@ def new_from_pretrained(
                 force_download=force_download,
                 proxies=proxies,
                 local_files_only=local_files_only,
-                use_auth_token=use_auth_token,
+                **auth_kwargs(use_auth_token),
                 revision=revision,
                 subfolder=subfolder,
                 _from_auto=from_auto_class,
