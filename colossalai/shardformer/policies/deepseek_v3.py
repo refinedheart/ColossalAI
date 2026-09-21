@@ -36,6 +36,13 @@ class DeepseekV3Policy(Policy):
 
         if self.shard_config.expert_parallel_size > 1:
             # expert parallel
+            # ⚠ 本路径**尚未适配 v5**，与 Mixtral 的 EP 同属一条主线（docs/27 §三 N32，待 P4/P5）。
+            # 与 Mixtral 不同的是这里只换 `mlp` 整块、没有单独的 `gate` 替换点，所以 v4 假设全在
+            # `EpDeepseekV3MoE` 内部：`topk_idx, topk_weight = self.gate(hidden_states)`（v5 的
+            # `DeepseekV3TopkRouter` 返回**三元组**，见 `modeling_deepseek_v3.py:229`）、
+            # `len(self.experts)` 与 `self.experts[i + ep_rank * experts_per_rank]`（v5 的 `experts`
+            # 是融合 3D 参数的模块，既不能 `len()` 也不能下标）—— 三项在 v5 下均不成立，需结构性重做。
+            # 本次只补说明、未改逻辑。
             self.append_or_create_submodule_replacement(
                 description=[
                     SubModuleReplacementDescription(
