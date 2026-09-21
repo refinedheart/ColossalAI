@@ -102,13 +102,11 @@ class LlamaPolicy(Policy):
                     num_kv_heads >= tp_size and num_kv_heads % tp_size == 0
                 ), f"The number of key_value heads must be divisible by, and must not be less than tensor parallel size."
             num_q_heads //= tp_size
+            # v5 reads `hidden_size` / `num_key_value_heads` off `self.config`, so only the local
+            # head count is written (the flash-attention forward in `modeling/llama.py` uses it).
             decoder_attribute_replacement = {
-                "self_attn.hidden_size": self.model.config.hidden_size // tp_size,
                 "self_attn.num_heads": num_q_heads,
             }
-            if getattr(self.model.config, "num_key_value_heads", False):
-                num_kv_heads //= tp_size
-                decoder_attribute_replacement["self_attn.num_key_value_heads"] = num_kv_heads
 
             policy[LlamaDecoderLayer] = ModulePolicyDescription(
                 attribute_replacement=decoder_attribute_replacement,
