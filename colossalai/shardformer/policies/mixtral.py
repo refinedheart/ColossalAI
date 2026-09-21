@@ -236,11 +236,9 @@ class MixtralPolicy(Policy):
             self.append_or_create_submodule_replacement(
                 description=[
                     SubModuleReplacementDescription(
-                        # v5 改名：`block_sparse_moe` → `mlp`。
-                        # 注意：EP 路径**不止改名** —— v5 的 `mlp.experts` 已是融合 3D 参数
-                        # （`gate_up_proj` / `down_proj`），`EPMixtralSparseMoeBlock` 依赖的
-                        # `num_experts` / `experts[i:j]` / `expert.w1,w2,w3` / `gate()` 返回 logits
-                        # **四项在 v5 下均不成立**，需结构性重做（见 docs/27 §三 N32，待 P4/P5）
+                        # v5 改名：`block_sparse_moe` → `mlp`；且 `mlp.experts` 已融合为 3D 参数
+                        # （`gate_up_proj` / `down_proj`）。`EPMixtralSparseMoeBlock` 的三原语重写
+                        # （docs/30 §四：布局切片 / 加载映射 / per-expert 调用）已落地，纯 EP 已验收。
                         suffix="mlp",
                         target_module=EPMixtralSparseMoeBlock,
                         kwargs={

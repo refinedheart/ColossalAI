@@ -39,7 +39,6 @@ from colossalai.shardformer.layer._operation import (
 )
 from colossalai.shardformer.layer.linear import Linear1D_Col, Linear1D_Row, LinearWithGradAccum, ParallelModule
 from colossalai.shardformer.shard import ShardConfig
-from colossalai.shardformer.shard.utils import set_tensors_to_none
 from colossalai.tensor.moe_tensor.api import set_moe_tensor_ep_group
 
 if is_flash_attn_2_available():
@@ -192,14 +191,25 @@ class EPMixtralSparseMoeBlock(ParallelModule):
         self.fp8_communication = fp8_communication
         self.use_zbv = use_zbv
 
-        if self.num_experts % self.ep_size != 0:
+        # v5 stores experts as fused 3D parameters (`gate_up_proj [E,2I,H]` / `down_proj [E,H,I]`), so
+        # `num_experts` lives on `self.experts`, not on the block (docs/30 §二).
+        num_experts = self.experts.num_experts
+        if num_experts % self.ep_size != 0:
             raise ValueError("The number of experts must be divisible by the number of expert parallel groups.")
 
-        self.num_experts_per_ep = self.num_experts // self.ep_size
+        self.num_experts = num_experts
+        self.num_experts_per_ep = num_experts // self.ep_size
         self.expert_start_idx = self.ep_rank * self.num_experts_per_ep
-        held_experts = self.experts[self.expert_start_idx : self.expert_start_idx + self.num_experts_per_ep]
 
-        set_tensors_to_none(self.experts, exclude=set(held_experts))
+        # primitive ① (docs/30 §4.1): slice the fused params to the local experts and release the rest
+        # (P5). `.clone()` is required, not `.contiguous()`: the dim-0 slice of a contiguous tensor is
+        # already contiguous, so `.contiguous()` would return the view and keep the full `[E, ...]` alive.
+        experts = self.experts
+        s = self.expert_start_idx
+        n = self.num_experts_per_ep
+        experts.gate_up_proj = torch.nn.Parameter(experts.gate_up_proj[s : s + n].clone())
+        experts.down_proj = torch.nn.Parameter(experts.down_proj[s : s + n].clone())
+        experts.num_experts = n
 
         # setup moe_dp group
         self.moe_dp_group = moe_dp_group
@@ -208,17 +218,14 @@ class EPMixtralSparseMoeBlock(ParallelModule):
         # setup global tp group
         self.tp_group = tp_group
         if self.tp_group.size() > 1:
-            for expert in held_experts:
-                expert.w1 = Linear1D_Col.from_native_module(
-                    expert.w1, self.tp_group, fp8_communication=self.fp8_communication, use_zbv=self.use_zbv
-                )
-                expert.w3 = Linear1D_Col.from_native_module(
-                    expert.w3, self.tp_group, fp8_communication=self.fp8_communication, use_zbv=self.use_zbv
-                )
-                expert.w2 = Linear1D_Row.from_native_module(
-                    expert.w2, self.tp_group, fp8_communication=self.fp8_communication, use_zbv=self.use_zbv
-                )
+            # TP-over-experts over the fused 3D params is a follow-up (docs/30 §六); not implemented yet.
+            raise NotImplementedError(
+                "Tensor parallelism over the fused v5 experts is not yet implemented (docs/30 §六); "
+                "use pure expert parallelism (tp_size=1) for now."
+            )
 
+        # primitive ② (docs/30 §4.2): mark the sliced fused params so the sharded loader slices dim 0
+        # (the expert dimension) by `ep_group`.
         for p in self.experts.parameters():
             set_moe_tensor_ep_group(p, ep_group)
 
@@ -238,19 +245,25 @@ class EPMixtralSparseMoeBlock(ParallelModule):
         module.setup_process_groups(tp_group, moe_dp_group, ep_group, fp8_communication)
         return module
 
+    def _expert_forward(self, x: torch.Tensor, expert_idx: int) -> torch.Tensor:
+        r"""Run one local expert on its dispatched tokens (docs/30 §4.3).
+
+        Mirrors v5's ``MixtralExperts.forward``: ``gate, up = linear(x, gate_up_proj[e]).chunk(2,
+        dim=-1)``, ``act_fn(gate) * up``, then ``linear(down_proj[e])``. The fused params are already
+        sliced to ``[E/ep, ...]``, so ``expert_idx`` is a local index.
+        """
+        gate, up = F.linear(x, self.experts.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+        return F.linear(self.experts.act_fn(gate) * up, self.experts.down_proj[expert_idx])
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        # router_logits: (batch * sequence_length, n_experts)
-        router_logits = self.gate(hidden_states)
+        # v5's `MixtralTopKRouter` returns the (logits, normalised top-k weights, top-k indices) triple;
+        # softmax / top-k / normalisation are already applied, so there is no local routing to redo here.
+        _, top_k_weights, top_k_index = self.gate(hidden_states)
+        routing_weights = top_k_weights.to(hidden_states.dtype)
 
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        # we cast back to the input dtype
-        routing_weights = routing_weights.to(hidden_states.dtype)
-
-        selected_experts = selected_experts.t().reshape(-1)
+        selected_experts = top_k_index.t().reshape(-1)
         selected_experts_idx = selected_experts.argsort()
         dispatch_states = hidden_states.repeat(self.top_k, 1)[selected_experts_idx]
         input_split_sizes = selected_experts.bincount(minlength=self.num_experts)
@@ -285,10 +298,8 @@ class EPMixtralSparseMoeBlock(ParallelModule):
         if output_states.size(0) > 0:
             if self.num_experts_per_ep == 1:
                 # no need to split
-                expert = self.experts[self.expert_start_idx]
                 output_states = DPGradScalerIn.apply(output_states, self.moe_dp_size, activate_experts[0])
-                output_states = expert.act_fn(expert.w1(output_states)) * expert.w3(output_states)
-                output_states = expert.w2(output_states)
+                output_states = self._expert_forward(output_states, 0)
                 output_states = DPGradScalerOut.apply(output_states, self.moe_dp_size, activate_experts[0])
             else:
                 output_states_splits = output_states.split(output_split_sizes.tolist())
@@ -296,15 +307,10 @@ class EPMixtralSparseMoeBlock(ParallelModule):
                 for i, split_states in enumerate(output_states_splits):
                     if split_states.size(0) == 0:
                         continue
-                    expert = self.experts[self.expert_start_idx + i % self.num_experts_per_ep]
-                    split_states = DPGradScalerIn.apply(
-                        split_states, self.moe_dp_size, activate_experts[i % self.num_experts_per_ep]
-                    )
-                    split_states = expert.act_fn(expert.w1(split_states)) * expert.w3(split_states)
-                    split_states = expert.w2(split_states)
-                    split_states = DPGradScalerOut.apply(
-                        split_states, self.moe_dp_size, activate_experts[i % self.num_experts_per_ep]
-                    )
+                    expert_idx = i % self.num_experts_per_ep
+                    split_states = DPGradScalerIn.apply(split_states, self.moe_dp_size, activate_experts[expert_idx])
+                    split_states = self._expert_forward(split_states, expert_idx)
+                    split_states = DPGradScalerOut.apply(split_states, self.moe_dp_size, activate_experts[expert_idx])
                     output_states_list.append(split_states)
                 output_states = torch.cat(output_states_list)
 
@@ -323,7 +329,7 @@ class EPMixtralSparseMoeBlock(ParallelModule):
         for i in range(1, self.top_k):
             output_states += k_hidden_states[i] * routing_weights[:, i, None]
         output_states = output_states.reshape(batch_size, sequence_length, hidden_dim)
-        return output_states, router_logits
+        return output_states
 
 
 class MixtralPipelineForwards:
