@@ -121,10 +121,14 @@ class MixtralPolicy(Policy):
             policy[MixtralDecoderLayer] = ModulePolicyDescription(
                 attribute_replacement=decoder_attribute_replacement,
                 sub_module_replacement=[
+                    # The SP attention forward multiplies `q_len` by `sp_size` and relies on the
+                    # q/k/v projections gathering the full sequence (o_proj splitting it back), so
+                    # they must carry `seq_parallel_mode` -- mirroring BERT's SP policy.
                     SubModuleReplacementDescription(
                         suffix="self_attn.q_proj",
                         target_module=Linear1D_Col,
                         kwargs={
+                            "seq_parallel_mode": sp_mode,
                             "fp8_communication": self.shard_config.fp8_communication,
                             "use_zbv": use_zbv,
                         },
@@ -133,6 +137,7 @@ class MixtralPolicy(Policy):
                         suffix="self_attn.k_proj",
                         target_module=Linear1D_Col,
                         kwargs={
+                            "seq_parallel_mode": sp_mode,
                             "fp8_communication": self.shard_config.fp8_communication,
                             "use_zbv": use_zbv,
                         },
@@ -141,6 +146,7 @@ class MixtralPolicy(Policy):
                         suffix="self_attn.v_proj",
                         target_module=Linear1D_Col,
                         kwargs={
+                            "seq_parallel_mode": sp_mode,
                             "fp8_communication": self.shard_config.fp8_communication,
                             "use_zbv": use_zbv,
                         },
@@ -149,6 +155,7 @@ class MixtralPolicy(Policy):
                         suffix="self_attn.o_proj",
                         target_module=Linear1D_Row,
                         kwargs={
+                            "seq_parallel_mode": sp_mode,
                             "fp8_communication": self.shard_config.fp8_communication,
                             "use_zbv": use_zbv,
                         },
@@ -159,6 +166,10 @@ class MixtralPolicy(Policy):
                         target_module=MixtralTopKRouter1D,
                         kwargs={
                             "gather_output": True,
+                            # SP 下序列按 rank 切分，专家的 TP gather 会把 rank r 的 token j 与
+                            # 另一个 rank 的 token j 对齐（实为不同 token）；router 权重极小，
+                            # 故 SP 时保持不切分、本地算全量 logits（见 modeling 的 early return）。
+                            "seq_parallel_mode": sp_mode,
                             "fp8_communication": self.shard_config.fp8_communication,
                             "use_zbv": use_zbv,
                         },
@@ -173,6 +184,7 @@ class MixtralPolicy(Policy):
                         suffix="self_attn.q_proj",
                         target_module=LinearWithGradAccum,
                         kwargs={
+                            "seq_parallel_mode": sp_mode,
                             "fp8_communication": self.shard_config.fp8_communication,
                             "use_zbv": use_zbv,
                         },
@@ -181,6 +193,7 @@ class MixtralPolicy(Policy):
                         suffix="self_attn.k_proj",
                         target_module=LinearWithGradAccum,
                         kwargs={
+                            "seq_parallel_mode": sp_mode,
                             "fp8_communication": self.shard_config.fp8_communication,
                             "use_zbv": use_zbv,
                         },
@@ -189,6 +202,7 @@ class MixtralPolicy(Policy):
                         suffix="self_attn.v_proj",
                         target_module=LinearWithGradAccum,
                         kwargs={
+                            "seq_parallel_mode": sp_mode,
                             "fp8_communication": self.shard_config.fp8_communication,
                             "use_zbv": use_zbv,
                         },
@@ -197,6 +211,7 @@ class MixtralPolicy(Policy):
                         suffix="self_attn.o_proj",
                         target_module=LinearWithGradAccum,
                         kwargs={
+                            "seq_parallel_mode": sp_mode,
                             "fp8_communication": self.shard_config.fp8_communication,
                             "use_zbv": use_zbv,
                         },
