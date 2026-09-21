@@ -49,7 +49,6 @@ class BertPolicy(Policy):
             BertLayer,
             BertModel,
             BertOutput,
-            BertSdpaSelfAttention,
             BertSelfOutput,
         )
 
@@ -80,13 +79,21 @@ class BertPolicy(Policy):
         use_zbv = self.pipeline_stage_manager is not None and self.pipeline_stage_manager.use_zbv
 
         if self.shard_config.enable_sequence_parallelism:
+            # transformers v5 dropped ``BertSdpaSelfAttention``: ``modeling_bert`` now only ships
+            # ``BertSelfAttention`` / ``BertCrossAttention``, and self-attention vs cross-attention is
+            # a **class** difference rather than a constructor flag. The SP forward therefore targets
+            # ``BertSelfAttention`` -- the class ``BertAttention`` instantiates whenever
+            # ``is_cross_attention`` is False. (Cross-attention stays on v5's own forward: the policy
+            # does not shard ``crossattention.*`` either, so there is no gathered sequence to fix up.)
+            from transformers.models.bert.modeling_bert import BertSelfAttention
+
             # Fix the tgt_len size in bert sequence parallel attention forward.
             self.append_or_create_method_replacement(
                 description={
                     "forward": get_bert_sequence_parallel_attention_forward(self.shard_config),
                 },
                 policy=policy,
-                target_key=BertSdpaSelfAttention,
+                target_key=BertSelfAttention,
             )
 
         if self.shard_config.enable_tensor_parallelism:
