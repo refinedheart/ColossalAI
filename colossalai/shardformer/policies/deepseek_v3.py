@@ -36,13 +36,12 @@ class DeepseekV3Policy(Policy):
 
         if self.shard_config.expert_parallel_size > 1:
             # expert parallel
-            # ⚠ 本路径**尚未适配 v5**，与 Mixtral 的 EP 同属一条主线（docs/27 §三 N32，待 P4/P5）。
-            # 与 Mixtral 不同的是这里只换 `mlp` 整块、没有单独的 `gate` 替换点，所以 v4 假设全在
-            # `EpDeepseekV3MoE` 内部：`topk_idx, topk_weight = self.gate(hidden_states)`（v5 的
-            # `DeepseekV3TopkRouter` 返回**三元组**，见 `modeling_deepseek_v3.py:229`）、
-            # `len(self.experts)` 与 `self.experts[i + ep_rank * experts_per_rank]`（v5 的 `experts`
-            # 是融合 3D 参数的模块，既不能 `len()` 也不能下标）—— 三项在 v5 下均不成立，需结构性重做。
-            # 本次只补说明、未改逻辑。
+            # 三原语重写已落地（docs/30 §四，与 Mixtral 的 `EPMixtralSparseMoeBlock` 同款）：① 布局切片
+            # （`setup_process_groups` 把融合 3D `gate_up_proj`/`down_proj` 按专家维 `.clone()` 切成本卡
+            # 份额）；② 加载映射（`set_moe_tensor_ep_group`）；③ per-expert 调用（`_expert_forward`）。
+            # 与 Mixtral 不同的是这里只换 `mlp` 整块、没有单独的 `gate` 替换点，且前
+            # `first_k_dense_replace` 层是 dense `DeepseekV3MLP`（`from_native_module` 里按类名跳过）。
+            # 纯 EP（tp=1）已就绪，待 4 卡 GPU 验收。
             self.append_or_create_submodule_replacement(
                 description=[
                     SubModuleReplacementDescription(

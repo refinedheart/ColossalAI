@@ -1,8 +1,8 @@
 from typing import List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.distributed import ProcessGroup
 from torch.nn import CrossEntropyLoss
 from transformers.cache_utils import Cache, DynamicCache
@@ -20,7 +20,6 @@ from colossalai.moe._operation import (
 )
 from colossalai.pipeline.stage_manager import PipelineStageManager
 from colossalai.shardformer.layer.linear import ParallelModule
-from colossalai.shardformer.shard.utils import set_tensors_to_none
 from colossalai.tensor.moe_tensor.api import set_moe_tensor_ep_group
 
 
@@ -42,21 +41,34 @@ class EpDeepseekV3MoE(ParallelModule):
 
         self.ep_size = dist.get_world_size(ep_group)
         self.ep_rank = dist.get_rank(ep_group)
-        self.num_experts = self.config.n_routed_experts
-        assert self.num_experts % self.ep_size == 0
-
         self.ep_group = ep_group
-        self.num_experts_per_ep = self.num_experts // self.ep_size
-        self.experts_per_rank = self.num_experts_per_ep
-        self.expert_start_idx = self.ep_rank * self.num_experts_per_ep
-        held_experts = self.experts[self.expert_start_idx : self.expert_start_idx + self.num_experts_per_ep]
 
-        set_tensors_to_none(self.experts, exclude=set(held_experts))
+        # v5 stores experts as fused 3D parameters (`gate_up_proj [E,2I,H]` / `down_proj [E,H,I]`), so
+        # `num_experts` lives on `self.experts`, not on the block (docs/30 §二).
+        num_experts = self.experts.num_experts
+        if num_experts % self.ep_size != 0:
+            raise ValueError("The number of experts must be divisible by the number of expert parallel groups.")
+
+        self.num_experts = num_experts
+        self.num_experts_per_ep = num_experts // self.ep_size
+        self.expert_start_idx = self.ep_rank * self.num_experts_per_ep
+
+        # primitive ① (docs/30 §4.1): slice the fused params to the local experts and release the rest
+        # (P5). `.clone()` is required, not `.contiguous()`: the dim-0 slice of a contiguous tensor is
+        # already contiguous, so `.contiguous()` would return the view and keep the full `[E, ...]` alive.
+        experts = self.experts
+        s = self.expert_start_idx
+        n = self.num_experts_per_ep
+        experts.gate_up_proj = torch.nn.Parameter(experts.gate_up_proj[s : s + n].clone())
+        experts.down_proj = torch.nn.Parameter(experts.down_proj[s : s + n].clone())
+        experts.num_experts = n
 
         # setup moe_dp group
         self.moe_dp_group = moe_dp_group
         self.moe_dp_size = dist.get_world_size(moe_dp_group)
 
+        # primitive ② (docs/30 §4.2): mark the sliced fused params so the sharded loader slices dim 0
+        # (the expert dimension) by `ep_group`.
         for p in self.experts.parameters():
             set_moe_tensor_ep_group(p, ep_group)
 
@@ -68,95 +80,105 @@ class EpDeepseekV3MoE(ParallelModule):
         *args,
         **kwargs,
     ) -> "EpDeepseekV3MoE":
+        # Materialize first, then slice: primitive ① clones the fused params, which must already be
+        # real tensors under lazy-init (mirrors EPMixtralSparseMoeBlock, docs/30 §四).
+        LazyInitContext.materialize(module)
+        # The first `first_k_dense_replace` layers keep a dense `DeepseekV3MLP` (no experts); only
+        # the MoE layers (`DeepseekV3MoE`) carry the fused 3D params to slice.
         if module.__class__.__name__ != "DeepseekV3MLP":
             module.__class__ = EpDeepseekV3MoE
             module.setup_process_groups(moe_dp_group, ep_group)
-        LazyInitContext.materialize(module)
         return module
+
+    def _expert_forward(self, x: torch.Tensor, expert_idx: int) -> torch.Tensor:
+        r"""Run one local expert on its dispatched tokens (docs/30 §4.3).
+
+        Mirrors v5's ``DeepseekV3Experts.forward``: ``gate, up = linear(x, gate_up_proj[e]).chunk(2,
+        dim=-1)``, ``act_fn(gate) * up``, then ``linear(down_proj[e])``. The fused params are already
+        sliced to ``[E/ep, ...]``, so ``expert_idx`` is a local index.
+        """
+        gate, up = F.linear(x, self.experts.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+        return F.linear(self.experts.act_fn(gate) * up, self.experts.down_proj[expert_idx])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
         orig_shape = hidden_states.shape
-        topk_idx, topk_weight = self.gate(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        y = self.moe_forward(hidden_states, topk_idx, topk_weight).view(*orig_shape)
-        if self.config.n_shared_experts is not None:
-            y = y + self.shared_experts(identity)
-        return y
+        # v5's `DeepseekV3TopkRouter` returns the (logits, top-k weights, top-k indices) triple; group
+        # scoring / top-k / normalisation / `routed_scaling_factor` are already applied inside it, so
+        # there is no local routing to redo here.
+        _, topk_weights, topk_indices = self.gate(hidden_states)
+        routing_weights = topk_weights.to(hidden_states.dtype)
 
-    def moe_forward(self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
-        cnts = topk_ids.new_zeros((topk_ids.shape[0], len(self.experts)))
-        cnts.scatter_(1, topk_ids, 1)
-        tokens_per_expert = cnts.sum(dim=0)
-        idxs = topk_ids.view(-1).argsort()
-        sorted_tokens = x[idxs // topk_ids.shape[1]]
-        if self.ep_size > 1:
-            tokens_per_ep_rank = tokens_per_expert.view(self.ep_size, -1).sum(dim=1)
-            tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
-            dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=self.ep_group)
+        # Unlike Mixtral, `DeepseekV3MoE` carries no `self.top_k`; it lives on the router.
+        top_k = self.gate.top_k
 
-            output_splits = tokens_per_expert_group.view(self.ep_size, -1).sum(1).tolist()
-            input_split_sizes = tokens_per_ep_rank.tolist()
+        selected_experts = topk_indices.t().reshape(-1)
+        selected_experts_idx = selected_experts.argsort()
+        dispatch_states = hidden_states.repeat(top_k, 1)[selected_experts_idx]
+        input_split_sizes = selected_experts.bincount(minlength=self.num_experts)
 
-            gathered_tokens, _ = all_to_all_uneven(sorted_tokens, input_split_sizes, output_splits, self.ep_group)
-            tokens_per_expert_post_gather = tokens_per_expert_group.view(self.ep_size, self.experts_per_rank).sum(dim=0)
-            gatherd_idxs = np.zeros(shape=(gathered_tokens.shape[0],), dtype=np.int32)
-            s = 0
-            for i, k in enumerate(tokens_per_expert_group.cpu().numpy()):
-                gatherd_idxs[s : s + k] = i % self.experts_per_rank
-                s += k
-            gatherd_idxs = gatherd_idxs.argsort()
-            sorted_tokens = gathered_tokens[gatherd_idxs]
-            tokens_per_expert = tokens_per_expert_post_gather
+        output_split_sizes = torch.zeros_like(input_split_sizes)
 
-            # moe-dp related code
-            activate_experts = tokens_per_expert_post_gather > 0
-            activate_experts = activate_experts.int()
-            dist.all_reduce(activate_experts, group=self.moe_dp_group)
+        dist.all_to_all_single(output_split_sizes, input_split_sizes, group=self.ep_group)
 
-            # ep related code
-            sorted_tokens = EPGradScalerIn.apply(sorted_tokens, self.ep_size)
+        with torch.no_grad():
+            activate_experts = output_split_sizes[: self.num_experts_per_ep].clone()
+            for i in range(1, self.ep_size):
+                activate_experts += output_split_sizes[i * self.num_experts_per_ep : (i + 1) * self.num_experts_per_ep]
+            activate_experts = (activate_experts > 0).float()
 
-        tokens_per_expert = tokens_per_expert.cpu().numpy()
+        dist.all_reduce(activate_experts, group=self.moe_dp_group)
 
-        outputs = []
-        start_idx = 0
-        for i, num_tokens in enumerate(tokens_per_expert):
-            end_idx = start_idx + num_tokens
-            if num_tokens == 0:
-                continue
-            expert = self.experts[i + self.ep_rank * self.experts_per_rank]
-            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-            # moe-dp related code
-            tokens_for_this_expert = DPGradScalerIn.apply(tokens_for_this_expert, self.moe_dp_size, activate_experts[i])
-            expert_out = expert(tokens_for_this_expert)
-            # moe-dp related code
-            expert_out = DPGradScalerOut.apply(expert_out, self.moe_dp_size, activate_experts[i])
-            outputs.append(expert_out)
-            start_idx = end_idx
+        input_split_list = input_split_sizes.view(self.ep_size, self.num_experts_per_ep).sum(dim=-1).tolist()
+        output_split_list = output_split_sizes.view(self.ep_size, self.num_experts_per_ep).sum(dim=-1).tolist()
 
-        if len(outputs) > 0:
-            outs = torch.cat(outputs, dim=0)
-        else:
-            assert sorted_tokens.numel() == 0, f"sorted_tokens: should be empty, but got {sorted_tokens.shape}"
-            outs = sorted_tokens
+        output_states, _ = all_to_all_uneven(
+            dispatch_states,
+            input_split_list,
+            output_split_list,
+            self.ep_group,
+        )
+        # compute expert output
+        output_states = EPGradScalerIn.apply(output_states, self.ep_size)
+        if output_states.size(0) > 0:
+            if self.num_experts_per_ep == 1:
+                # no need to split
+                output_states = DPGradScalerIn.apply(output_states, self.moe_dp_size, activate_experts[0])
+                output_states = self._expert_forward(output_states, 0)
+                output_states = DPGradScalerOut.apply(output_states, self.moe_dp_size, activate_experts[0])
+            else:
+                output_states_splits = output_states.split(output_split_sizes.tolist())
+                output_states_list = []
+                for i, split_states in enumerate(output_states_splits):
+                    if split_states.size(0) == 0:
+                        continue
+                    expert_idx = i % self.num_experts_per_ep
+                    split_states = DPGradScalerIn.apply(split_states, self.moe_dp_size, activate_experts[expert_idx])
+                    split_states = self._expert_forward(split_states, expert_idx)
+                    split_states = DPGradScalerOut.apply(split_states, self.moe_dp_size, activate_experts[expert_idx])
+                    output_states_list.append(split_states)
+                output_states = torch.cat(output_states_list)
 
-        if self.ep_size > 1:
-            outs = EPGradScalerOut.apply(outs, self.ep_size)
-            new_x = torch.empty_like(outs)
-            new_x[gatherd_idxs] = outs
-            gathered_tokens, _ = all_to_all_uneven(new_x, output_splits, input_split_sizes, self.ep_group)
-            outs = gathered_tokens
-
-        new_x = torch.empty_like(outs)
-        new_x[idxs] = outs
-        final_out = (
-            (new_x.view(*topk_ids.shape, -1).type(topk_weight.dtype) * topk_weight.unsqueeze(dim=-1))
-            .sum(dim=1)
-            .type(new_x.dtype)
+        output_states = EPGradScalerOut.apply(output_states, self.ep_size)
+        dispatch_states, _ = all_to_all_uneven(
+            output_states, output_split_list, input_split_list, self.ep_group
         )
 
-        return final_out
+        recover_experts_idx = torch.empty_like(selected_experts_idx)
+        recover_experts_idx[selected_experts_idx] = torch.arange(
+            selected_experts_idx.size(0), device=selected_experts_idx.device
+        )
+        dispatch_states = dispatch_states[recover_experts_idx]
+        k_hidden_states = dispatch_states.chunk(top_k)
+        output_states = k_hidden_states[0] * routing_weights[:, 0, None]
+        for i in range(1, top_k):
+            output_states += k_hidden_states[i] * routing_weights[:, i, None]
+        output_states = output_states.view(*orig_shape)
+
+        if self.config.n_shared_experts is not None:
+            output_states = output_states + self.shared_experts(identity)
+        return output_states
 
 
 # v5 records `attentions` / `hidden_states` declaratively and injects them via `@capture_outputs`.
