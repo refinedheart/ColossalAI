@@ -8,6 +8,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from transformers.masking_utils import create_causal_mask
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -64,7 +65,9 @@ class LlamaPipelineForwards:
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        if use_cache:
+        # This forward also replaces `LlamaModel.forward` when PP is off (plain TP / SP / FA /
+        # inference), so the cache must only be disabled when PP is actually on.
+        if use_cache and stage_manager is not None:
             logger.warning_once(
                 "`use_cache=True` is incompatible with pipeline parallelism. Setting `use_cache=False`..."
             )
@@ -103,7 +106,12 @@ class LlamaPipelineForwards:
         past_seen_tokens = 0
         if use_cache:  # kept for BC (cache positions)
             if not isinstance(past_key_values, StaticCache):
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+                # v5 dropped `from_legacy_cache` / `to_legacy_cache`; `DynamicCache(...)`
+                # accepts the same per-layer `(key, value)` tuples.
+                if past_key_values is None:
+                    past_key_values = DynamicCache()
+                elif not isinstance(past_key_values, Cache):
+                    past_key_values = DynamicCache(past_key_values)
                 past_seen_tokens = past_key_values.get_seq_length()
         if cache_position is None:
             if isinstance(past_key_values, StaticCache):
@@ -118,9 +126,8 @@ class LlamaPipelineForwards:
         if output_hidden_states:
             logger.warning_once("output_hidden_states=True is not supported for pipeline models at the moment.")
             output_hidden_states = False
-        if use_cache:
-            logger.warning_once("use_cache=True is not supported for pipeline models at the moment.")
-            use_cache = False
+        # `output_attentions` / `output_hidden_states` stay disabled: the values accumulated
+        # below are per-rank shards taken before `gather_sp_output`, i.e. not the full sequence.
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
@@ -139,8 +146,15 @@ class LlamaPipelineForwards:
                 invert=(sp_mode != "ring_attn"),
             )
         else:
-            attn_kwargs: torch.Tensor = self._update_causal_mask(
-                attention_mask, hidden_states, cache_position, past_key_values
+            # `allow_is_causal_skip=False` is required: the attention below uses an explicit
+            # softmax, so a skipped (`None`) mask would silently attend to every position.
+            attn_kwargs: torch.Tensor = create_causal_mask(
+                config=self.config,
+                inputs_embeds=hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+                allow_is_causal_skip=False,
             )
 
         # Support SP + PP. Later stages have already received the split input.
@@ -165,13 +179,7 @@ class LlamaPipelineForwards:
                     hidden_states, 1, sp_group, 1 / sp_size, fp8_communication=shard_config.fp8_communication
                 )
 
-        if self.gradient_checkpointing and self.training and use_cache:
-            if use_cache:
-                logger.warning_once(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                )
-                use_cache = False
-
+        # v5 resolves the checkpointing / cache conflict inside `GradientCheckpointingLayer`.
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -195,35 +203,25 @@ class LlamaPipelineForwards:
         for idx, decoder_layer in enumerate(self.layers[start_idx:end_idx], start=start_idx):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-            if idx - start_idx < num_ckpt_layers:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    attn_kwargs,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attn_kwargs,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                )
-            hidden_states = layer_outputs[0]
+            if self.gradient_checkpointing and self.training:
+                # v5 checkpoints inside `GradientCheckpointingLayer.__call__`, based on a per-layer
+                # flag; set it directly to keep ColossalAI's "first N layers only" extension.
+                decoder_layer.gradient_checkpointing = idx - start_idx < num_ckpt_layers
+            # Keyword names must match v5's `DecoderLayer.forward`; unknown ones land in `**kwargs`.
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=attn_kwargs,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                position_embeddings=position_embeddings,
+            )
+            # v5's `DecoderLayer.forward` returns a bare tensor.
+            hidden_states = layer_outputs
 
             if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                # v5 updates the cache in place instead of returning it.
+                next_decoder_cache = past_key_values
 
         if disable_pp or stage_manager.is_last_stage():
             hidden_states = self.norm(hidden_states)
@@ -491,7 +489,9 @@ def get_llama_flash_attention_forward(shard_config: ShardConfig, sp_mode=None, s
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[Union[torch.Tensor, Dict]] = None,
-        past_key_value: Optional[Cache] = None,
+        # v5 renamed this argument to the plural `past_key_values`; the old name would be
+        # swallowed by `**kwargs` and the cache silently dropped.
+        past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -509,6 +509,9 @@ def get_llama_flash_attention_forward(shard_config: ShardConfig, sp_mode=None, s
 
         bsz, q_len, _ = hidden_states.size()
         input_shape = hidden_states.shape[:-1]
+        # v5's attention has no `num_heads` attribute; it is only written by the TP and
+        # SP-all_to_all policies, so read it defensively.
+        num_heads = getattr(self, "num_heads", None) or self.config.num_attention_heads
         # sp: modify sp_len when sequence parallel mode is ring
         if is_share_sp_tp(sp_mode):
             q_len *= sp_size
@@ -529,22 +532,20 @@ def get_llama_flash_attention_forward(shard_config: ShardConfig, sp_mode=None, s
         value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            if self.layer_idx is None:
-                raise ValueError(
-                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-                    "with a layer index."
-                )
-
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        if past_key_values is not None and self.layer_idx is None:
+            raise ValueError(
+                f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                "with a layer index."
+            )
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        if past_key_values is not None:
+            # v5 removed `Cache.get_usable_length`; `update` returns k/v including history.
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+            kv_seq_len = key_states.shape[-2]
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -566,9 +567,9 @@ def get_llama_flash_attention_forward(shard_config: ShardConfig, sp_mode=None, s
             attn_output = ColoAttention.attention(query_states, key_states, value_states, **attention_mask)
         else:
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+            if attn_weights.size() != (bsz, num_heads, q_len, kv_seq_len):
                 raise ValueError(
-                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                    f"Attention weights should be of size {(bsz, num_heads, q_len, kv_seq_len)}, but is"
                     f" {attn_weights.size()}"
                 )
 
@@ -583,16 +584,16 @@ def get_llama_flash_attention_forward(shard_config: ShardConfig, sp_mode=None, s
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             attn_output = torch.matmul(attn_weights, value_states)
 
-            if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            if attn_output.size() != (bsz, num_heads, q_len, self.head_dim):
                 raise ValueError(
-                    f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                    f"`attn_output` should be of size {(bsz, num_heads, q_len, self.head_dim)}, but is"
                     f" {attn_output.size()}"
                 )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         # sp: all-to-all comminucation when introducing sequence parallel
         if sp_mode == "all_to_all":
-            attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+            attn_output = attn_output.reshape(bsz, q_len, num_heads * self.head_dim)
             attn_output = all_to_all_comm(
                 attn_output, sp_group, scatter_dim=1, gather_dim=2, fp8_communication=shard_config.fp8_communication
             )
