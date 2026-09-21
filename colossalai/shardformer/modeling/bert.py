@@ -3,6 +3,8 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from transformers.cache_utils import Cache, DynamicCache, EncoderDecoderCache
+from transformers.masking_utils import create_bidirectional_mask, create_causal_mask
 from transformers.modeling_outputs import (
     BaseModelOutputWithPoolingAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
@@ -127,34 +129,28 @@ class BertPipelineForwards:
             logger.warning_once("use_cache=True is not supported for pipeline models at the moment.")
             use_cache = False
 
+        # `head_mask` is gone in v5 (`get_head_mask` was removed too). The other PP forwards still
+        # pass it by name, so the parameter stays; a non-None value warns instead of being
+        # swallowed by v5's `**kwargs` like upstream does.
+        if head_mask is not None:
+            logger.warning_once(
+                "`head_mask` is not supported for pipeline models at the moment and was removed in "
+                "transformers v5; the value is ignored."
+            )
+
         # past_key_values_length
-        past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+        # v5 dropped `DynamicCache.from_legacy_cache` / `to_legacy_cache` /
+        # `Cache.get_usable_length`; lengths come from `get_seq_length()`. A non-`Cache` argument
+        # raises rather than falling back to the old `past_key_values[0][0].shape[2]`.
+        if past_key_values is not None and not isinstance(past_key_values, Cache):
+            raise TypeError(
+                "`past_key_values` must be a `transformers.cache_utils.Cache` under transformers v5 "
+                f"(got {type(past_key_values).__name__}); the legacy tuple format was removed upstream."
+            )
+        past_key_values_length = past_key_values.get_seq_length() if past_key_values is not None else 0
 
         if attention_mask is None:
             attention_mask = torch.ones(((batch_size, seq_length + past_key_values_length)), device=device)
-
-        # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
-        # ourselves in which case we just need to make it broadcastable to all heads.
-        extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_shape)
-        attention_mask = extended_attention_mask
-        # If a 2D or 3D attention mask is provided for the cross-attention
-        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
-        if self.config.is_decoder and encoder_hidden_states is not None:
-            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
-            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
-            if encoder_attention_mask is None:
-                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
-            encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
-        else:
-            encoder_extended_attention_mask = None
-
-        # Prepare head mask if needed
-        # 1.0 in head_mask indicate we keep the head
-        # attention_probs has shape bsz x n_heads x N x N
-        # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
-        # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
-        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
-        hidden_states = hidden_states if hidden_states is not None else None
 
         if stage_manager.is_first_stage():
             hidden_states = self.embeddings(
@@ -165,17 +161,49 @@ class BertPipelineForwards:
                 past_key_values_length=past_key_values_length,
             )
 
+        # The mask is built after the embeddings because v5's helpers infer shape / dtype / device
+        # from the embedding output (their second parameter is `inputs_embeds`, where v4's
+        # `get_extended_attention_mask` only wanted `input_shape`). Off the first stage,
+        # `hidden_states` holds the activations from the previous stage, which are equivalent for
+        # that purpose.
+        if self.config.is_decoder:
+            attention_mask = create_causal_mask(
+                config=self.config,
+                inputs_embeds=hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+            )
+        else:
+            attention_mask = create_bidirectional_mask(
+                config=self.config,
+                inputs_embeds=hidden_states,
+                attention_mask=attention_mask,
+            )
+
+        # If a 2D or 3D attention mask is provided for the cross-attention
+        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
+        if self.config.is_decoder and encoder_hidden_states is not None:
+            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
+            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
+            if encoder_attention_mask is None:
+                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
+            encoder_extended_attention_mask = create_bidirectional_mask(
+                config=self.config,
+                inputs_embeds=hidden_states,
+                attention_mask=encoder_attention_mask,
+                encoder_hidden_states=encoder_hidden_states,
+            )
+        else:
+            encoder_extended_attention_mask = None
+
         # inherit from bert_layer,this should be changed when we add the feature to record hidden_states
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
 
-        if self.encoder.gradient_checkpointing and self.encoder.training:
-            if use_cache:
-                logger.warning_once(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                )
-                use_cache = False
+        # The old `self.encoder.gradient_checkpointing` guard would now raise: v5's `BertEncoder` is
+        # a plain `nn.Module` with no such attribute. Checking pointing is handled by each
+        # `BertLayer` (a `GradientCheckpointingLayer`) instead -- see the loop below.
         next_decoder_cache = () if use_cache else None
 
         start_idx, end_idx = stage_index[0], stage_index[1]
@@ -207,42 +235,25 @@ class BertPipelineForwards:
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            layer_head_mask = head_mask[idx] if head_mask is not None else None
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
-
-            if self.encoder.gradient_checkpointing and self.encoder.training:
-
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        return module(*inputs, past_key_value, output_attentions)
-
-                    return custom_forward
-
-                layer_outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(encoder_layer),
-                    hidden_states,
-                    attention_mask,
-                    layer_head_mask,
-                    encoder_hidden_states,
-                    encoder_attention_mask,
-                )
-            else:
-                layer_outputs = encoder_layer(
-                    hidden_states,
-                    attention_mask,
-                    layer_head_mask,
-                    encoder_hidden_states,
-                    encoder_attention_mask,
-                    past_key_value,
-                    output_attentions,
-                )
-            hidden_states = layer_outputs[0]
+            # v5's `BertLayer.forward` takes `(hidden_states, attention_mask, encoder_hidden_states,
+            # encoder_attention_mask, past_key_values, **kwargs)`: no `head_mask` and no
+            # `output_attentions`, and it returns a bare tensor rather than `(hidden, [attn...])`.
+            # Passing positionally would land arguments on the wrong parameters and mis-compute
+            # silently, so `past_key_values` goes by name here (one whole `Cache`, indexed inside
+            # `Cache.update`, not `past_key_values[idx]` per layer) and the result is used directly.
+            # `hidden_states` stays positional, as `BertLayer.__call__` requires.
+            layer_outputs = encoder_layer(
+                hidden_states,
+                attention_mask,
+                encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                past_key_values=past_key_values,
+            )
+            hidden_states = layer_outputs
             if use_cache:
-                next_decoder_cache += (layer_outputs[-1],)
-            if output_attentions:
-                all_self_attentions = all_self_attentions + (layer_outputs[1],)
-                if self.config.add_cross_attention:
-                    all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
+                next_decoder_cache = past_key_values
+            # `all_self_attentions` / `all_cross_attentions` stay None: this path forces
+            # `output_attentions` to False above, and v5's `BertLayer` no longer returns them.
 
         # When sequence parallelism done, gather the output tensor in forward and split it in backward
         if shard_config is not None and shard_config.enable_sequence_parallelism:
@@ -262,18 +273,20 @@ class BertPipelineForwards:
 
         if stage_manager.is_last_stage():
             pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
+            outputs = BaseModelOutputWithPoolingAndCrossAttentions(
+                last_hidden_state=sequence_output,
+                pooler_output=pooled_output,
+                past_key_values=next_decoder_cache,
+                hidden_states=all_hidden_states,
+                attentions=all_self_attentions,
+                cross_attentions=all_cross_attentions,
+            )
             if not return_dict:
-                return (sequence_output, pooled_output) + layer_outputs[1:]
-            # return dict is not supported at this moment
-            else:
-                return BaseModelOutputWithPoolingAndCrossAttentions(
-                    last_hidden_state=sequence_output,
-                    pooler_output=pooled_output,
-                    past_key_values=next_decoder_cache,
-                    hidden_states=all_hidden_states,
-                    attentions=all_self_attentions,
-                    cross_attentions=all_cross_attentions,
-                )
+                # The old `(sequence_output, pooled_output) + layer_outputs[1:]` would slice a
+                # tensor now that `layer_outputs` is a bare tensor. `to_tuple()` follows the
+                # dataclass field order instead of a hand-written literal.
+                return outputs.to_tuple()
+            return outputs
 
         # output of non-first and non-last stages: must be a dict
         else:
@@ -1037,184 +1050,141 @@ def get_jit_fused_bert_output_forward():
     return forward
 
 
-# Fix the tgt_len size in sequence parallel attention:
-# same with the one in BertSdpaSelfAttention forward in v4.51.3 transformers except the
+# Fix the tgt_len size in sequence parallel attention. Under ``split_gather``, ``self.query`` /
+# ``self.key`` / ``self.value`` are ``Linear1D_Col(seq_parallel_mode=...)``, which **gather the full
+# sequence** in forward (``linear_gather_forward_reducescatter_backward``), while ``hidden_states``
+# only holds this rank's shard. v5's ``BertSelfAttention.forward`` derives the output shape from
+# ``hidden_states`` (``input_shape = hidden_states.shape[:-1]``), so it would reshape a
+# full-sequence ``attn_output`` into a shard-shaped tensor -- the element counts do not even match.
+# Taking the shape from the projection output instead is the only reason this override exists;
+# everything else follows v5's own ``BertSelfAttention.forward``.
 def get_bert_sequence_parallel_attention_forward(shard_config: ShardConfig):
-    from transformers.models.bert.modeling_bert import BertSdpaSelfAttention
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    from transformers.models.bert.modeling_bert import BertSelfAttention, eager_attention_forward
 
     def forward(
-        self: BertSdpaSelfAttention,
+        self: BertSelfAttention,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-        output_attentions: Optional[bool] = False,
-    ) -> Tuple[torch.Tensor]:
+        past_key_values: Optional[Cache] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # `full_shape` is derived from the projection output, not from `hidden_states` -- see above.
+        projected = self.query(hidden_states)
+        full_shape = (*projected.shape[:-1], -1, self.attention_head_size)
+        query_layer = projected.view(*full_shape).transpose(1, 2)
+        key_layer = self.key(hidden_states).view(*full_shape).transpose(1, 2)
+        value_layer = self.value(hidden_states).view(*full_shape).transpose(1, 2)
 
-        bsz, tgt_len, _ = hidden_states.size()
+        if past_key_values is not None:
+            # One whole `Cache`, indexed inside `update(k, v, layer_idx)` -- no per-layer tuple
+            # subscripts, and no v4 prefix-tuning branch on `past_key_value[0]`.
+            current_past_key_values = past_key_values
+            if isinstance(past_key_values, EncoderDecoderCache):
+                current_past_key_values = past_key_values.self_attention_cache
+            key_layer, value_layer = current_past_key_values.update(key_layer, value_layer, self.layer_idx)
 
-        query_layer = self.transpose_for_scores(self.query(hidden_states))
-
-        # If this is instantiated as a cross-attention module, the keys and values come from an encoder; the attention
-        # mask needs to be such that the encoder's padding tokens are not attended to.
-        is_cross_attention = encoder_hidden_states is not None
-
-        current_states = encoder_hidden_states if is_cross_attention else hidden_states
-        attention_mask = encoder_attention_mask if is_cross_attention else attention_mask
-
-        # Check `seq_length` of `past_key_value` == `len(current_states)` to support prefix tuning
-        if is_cross_attention and past_key_value and past_key_value[0].shape[2] == current_states.shape[1]:
-            key_layer, value_layer = past_key_value
-        else:
-            key_layer = self.transpose_for_scores(self.key(current_states))
-            value_layer = self.transpose_for_scores(self.value(current_states))
-            if past_key_value is not None and not is_cross_attention:
-                key_layer = torch.cat([past_key_value[0], key_layer], dim=2)
-                value_layer = torch.cat([past_key_value[1], value_layer], dim=2)
-
-        if self.is_decoder:
-            # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
-            # Further calls to cross_attention layer can then reuse all cross-attention
-            # key/value_states (first "if" case)
-            # if uni-directional self-attention (decoder) save Tuple(torch.Tensor, torch.Tensor) of
-            # all previous decoder key/value_states. Further calls to uni-directional self-attention
-            # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
-            # if encoder bi-directional self-attention `past_key_value` is always `None`
-            past_key_value = (key_layer, value_layer)
-
-        # SDPA with memory-efficient backend is broken in torch==2.1.2 when using non-contiguous inputs and a custom
-        # attn_mask, so we need to call `.contiguous()` here. This was fixed in torch==2.2.0.
-        # Reference: https://github.com/pytorch/pytorch/issues/112577
-        if self.require_contiguous_qkv and query_layer.device.type == "cuda" and attention_mask is not None:
-            query_layer = query_layer.contiguous()
-            key_layer = key_layer.contiguous()
-            value_layer = value_layer.contiguous()
-
-        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
-        # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
-        # The tgt_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create
-        # a causal mask in case tgt_len == 1.
-        is_causal = (
-            True if self.is_decoder and not is_cross_attention and attention_mask is None and tgt_len > 1 else False
+        # `attention_mask` comes from v5's `create_bidirectional_mask` / `create_causal_mask`,
+        # already in the form the attention interface consumes, so the old hand-rolled `is_causal`
+        # dispatch to SDPA is gone.
+        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
         )
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
+        attn_output, attn_weights = attention_interface(
+            self,
             query_layer,
             key_layer,
             value_layer,
-            attn_mask=attention_mask,
-            dropout_p=self.dropout_prob if self.training else 0.0,
-            is_causal=is_causal,
+            attention_mask,
+            dropout=0.0 if not self.training else self.dropout.p,
+            scaling=self.scaling,
+            **kwargs,
         )
-
-        attn_output = attn_output.transpose(1, 2)
-        _, _, tgt_len, _ = query_layer.shape
-        attn_output = attn_output.reshape(bsz, tgt_len, self.all_head_size)
-
-        outputs = (attn_output,)
-        if self.is_decoder:
-            outputs = outputs + (past_key_value,)
-        return outputs
+        # `full_shape[1]` is the gathered, full sequence length, not this rank's shard.
+        attn_output = attn_output.reshape(full_shape[0], full_shape[1], -1).contiguous()
+        return attn_output, attn_weights
 
     return forward
 
 
 def bert_sequence_parallel_forward_fn(shard_config: ShardConfig):
+    r"""Replacement of ``BertModel.forward`` for ``split_gather`` sequence parallelism.
+
+    Only the sequence splitting/gathering at the two ends of the encoder is ours; the rest is kept
+    line-for-line equal to v5's ``BertModel.forward`` so that the v5 contracts (mask construction,
+    ``Cache``, declarative output capture) hold:
+
+    * ``embedding_output`` is split along the sequence dim before the encoder, and
+      ``sequence_output`` is gathered back before the pooler.
+    * The attention mask is built from the **full** (pre-split) embeddings -- v5's mask helpers infer
+      the shapes from ``inputs_embeds``, and the q/k/v projections gather the sequence back anyway,
+      so attention runs over the full sequence on every rank. Building the mask after the split
+      would produce a shard-sized mask that cannot broadcast against full-sequence attention.
+    * ``@capture_outputs`` is re-attached: it is v5's only producer of ``attentions`` /
+      ``hidden_states`` (via hooks on ``BertLayer`` / ``BertSelfAttention``). Without it a replaced
+      ``BertModel.forward`` silently loses both, and ``BertForPreTraining.forward`` reads
+      ``outputs.attentions`` off our return value.
+    """
+    from transformers.utils.generic import merge_with_config_defaults
+    from transformers.utils.output_capturing import capture_outputs
+
+    @merge_with_config_defaults
+    @capture_outputs
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> Union[Tuple[torch.Tensor], BaseModelOutputWithPoolingAndCrossAttentions]:
         r"""
-        encoder_hidden_states  (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-            Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention if
-            the model is configured as a decoder.
-        encoder_attention_mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Mask to avoid performing attention on the padding token indices of the encoder input. This mask is used in
-            the cross-attention if the model is configured as a decoder. Mask values selected in `[0, 1]`:
-
-            - 1 for tokens that are **not masked**,
-            - 0 for tokens that are **masked**.
-        past_key_values (`tuple(tuple(torch.FloatTensor))` of length `config.n_layers` with each tuple having 4 tensors of shape `(batch_size, num_heads, sequence_length - 1, embed_size_per_head)`):
-            Contains precomputed key and value hidden states of the attention blocks. Can be used to speed up decoding.
-
-            If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those that
-            don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of all
-            `decoder_input_ids` of shape `(batch_size, sequence_length)`.
-        use_cache (`bool`, *optional*):
-            If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
-            `past_key_values`).
+        `output_attentions` / `output_hidden_states` / `return_dict` are not read by this body under
+        v5: the first two are read off the call-site kwargs by the `@capture_outputs` wrapper, which
+        then injects what it recorded, and it pops the third one and calls `to_tuple()` for `False`.
+        All three are kept for API shape only.
         """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        logger = logging.get_logger(__name__)
+
+        # `head_mask` was removed from `BertModel.forward` in v5 (along with `get_head_mask`).
+        # Upstream lets it ride `**kwargs` into attention; popping it here makes "passed but ignored"
+        # visible instead.
+        head_mask = kwargs.pop("head_mask", None)
+        if head_mask is not None:
+            logger.warning_once("`head_mask` was removed from `BertModel.forward` in transformers v5 and is ignored.")
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if self.config.is_decoder:
             use_cache = use_cache if use_cache is not None else self.config.use_cache
         else:
             use_cache = False
 
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
-        elif input_ids is not None:
-            input_shape = input_ids.size()
-        elif inputs_embeds is not None:
-            input_shape = inputs_embeds.size()[:-1]
-        else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
+        if past_key_values is not None and not isinstance(past_key_values, Cache):
+            raise TypeError(
+                "`past_key_values` must be a `transformers.cache_utils.Cache` under transformers v5 "
+                f"(got {type(past_key_values).__name__}); the legacy tuple format was removed upstream."
+            )
+        if use_cache and past_key_values is None:
+            # v5 dropped `DynamicCache.from_legacy_cache` / `to_legacy_cache` /
+            # `get_usable_length`: the cache is constructed directly and lengths come from
+            # `get_seq_length()`.
+            past_key_values = (
+                EncoderDecoderCache(DynamicCache(config=self.config), DynamicCache(config=self.config))
+                if encoder_hidden_states is not None or self.config.is_encoder_decoder
+                else DynamicCache(config=self.config)
+            )
 
-        batch_size, seq_length = input_shape
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
-
-        # past_key_values_length
-        past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
-
-        if attention_mask is None:
-            attention_mask = torch.ones(((batch_size, seq_length + past_key_values_length)), device=device)
-
-        if token_type_ids is None:
-            if hasattr(self.embeddings, "token_type_ids"):
-                buffered_token_type_ids = self.embeddings.token_type_ids[:, :seq_length]
-                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(batch_size, seq_length)
-                token_type_ids = buffered_token_type_ids_expanded
-            else:
-                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
-
-        # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
-        # ourselves in which case we just need to make it broadcastable to all heads.
-        extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_shape)
-
-        # If a 2D or 3D attention mask is provided for the cross-attention
-        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
-        if self.config.is_decoder and encoder_hidden_states is not None:
-            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
-            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
-            if encoder_attention_mask is None:
-                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
-            encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
-        else:
-            encoder_extended_attention_mask = None
-
-        # Prepare head mask if needed
-        # 1.0 in head_mask indicate we keep the head
-        # attention_probs has shape bsz x n_heads x N x N
-        # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
-        # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
-        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+        past_key_values_length = past_key_values.get_seq_length() if past_key_values is not None else 0
 
         embedding_output = self.embeddings(
             input_ids=input_ids,
@@ -1223,6 +1193,30 @@ def bert_sequence_parallel_forward_fn(shard_config: ShardConfig):
             inputs_embeds=inputs_embeds,
             past_key_values_length=past_key_values_length,
         )
+
+        # The mask is built after the embeddings (v5's helpers need the embedding output to infer
+        # shape/dtype/device) but before the split -- see the function docstring.
+        if self.config.is_decoder:
+            attention_mask = create_causal_mask(
+                config=self.config,
+                inputs_embeds=embedding_output,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+            )
+        else:
+            attention_mask = create_bidirectional_mask(
+                config=self.config,
+                inputs_embeds=embedding_output,
+                attention_mask=attention_mask,
+            )
+
+        if encoder_attention_mask is not None:
+            encoder_attention_mask = create_bidirectional_mask(
+                config=self.config,
+                inputs_embeds=embedding_output,
+                attention_mask=encoder_attention_mask,
+                encoder_hidden_states=encoder_hidden_states,
+            )
 
         # split the input tensor along sequence dimension
         # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len/TP_size, hidden_size]
@@ -1242,18 +1236,19 @@ def bert_sequence_parallel_forward_fn(shard_config: ShardConfig):
 
         encoder_outputs = self.encoder(
             embedding_output,
-            attention_mask=extended_attention_mask,
-            head_mask=head_mask,
+            attention_mask=attention_mask,
             encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_extended_attention_mask,
+            encoder_attention_mask=encoder_attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            position_ids=position_ids,
+            **kwargs,
         )
 
-        sequence_output = encoder_outputs[0]
+        # v5's `BertEncoder.forward` returns only `last_hidden_state` / `past_key_values` and its
+        # layers return bare tensors: `attentions` / `hidden_states` are no longer accumulated, they
+        # are injected by `@capture_outputs`.
+        sequence_output = encoder_outputs.last_hidden_state
 
         # When sequence parallelism done, gather the output tensor in forward and split it in backward
         sequence_output = gather_forward_split_backward(
@@ -1265,16 +1260,10 @@ def bert_sequence_parallel_forward_fn(shard_config: ShardConfig):
 
         pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
 
-        if not return_dict:
-            return (sequence_output, pooled_output) + encoder_outputs[1:]
-
         return BaseModelOutputWithPoolingAndCrossAttentions(
             last_hidden_state=sequence_output,
             pooler_output=pooled_output,
             past_key_values=encoder_outputs.past_key_values,
-            hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
-            cross_attentions=encoder_outputs.cross_attentions,
         )
 
     return forward
