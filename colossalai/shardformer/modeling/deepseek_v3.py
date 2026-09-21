@@ -6,8 +6,9 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 from torch.nn import CrossEntropyLoss
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
+from transformers.masking_utils import create_causal_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.utils.output_capturing import capture_outputs
 
 from colossalai.lazy import LazyInitContext
 from colossalai.moe._operation import (
@@ -158,6 +159,10 @@ class EpDeepseekV3MoE(ParallelModule):
         return final_out
 
 
+# v5 records `attentions` / `hidden_states` declaratively and injects them via `@capture_outputs`.
+# v5's own forward carries that decorator and ours replaces it, so it has to be put back. Unlike
+# Mixtral, the recorded classes survive here (the policy keeps `self_attn`).
+@capture_outputs
 def deepseek_v3_model_forward(
     self,
     input_ids: torch.LongTensor = None,
@@ -172,11 +177,11 @@ def deepseek_v3_model_forward(
     stage_manager: Optional[PipelineStageManager] = None,
     stage_index: Optional[List[int]] = None,
     hidden_states_internal: Optional[torch.Tensor] = None,
+    **kwargs,
 ) -> Union[Tuple, BaseModelOutputWithPast]:
-    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-    output_hidden_states = (
-        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-    )
+    # Not consumed here under v5: the `@capture_outputs` wrapper reads these from `kwargs` to
+    # decide what to record, then injects the result. Kept for API shape, and deliberately not
+    # resolved -- a resolved value would look like this body accumulates them itself.
     use_cache = use_cache if use_cache is not None else self.config.use_cache
 
     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -193,10 +198,14 @@ def deepseek_v3_model_forward(
 
     past_key_values_length = 0
     if use_cache:
-        use_legacy_cache = not isinstance(past_key_values, Cache)
-        if use_legacy_cache:
-            past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-        past_key_values_length = past_key_values.get_usable_length(seq_length)
+        # v5 dropped `DynamicCache.from_legacy_cache` / `to_legacy_cache` and
+        # `Cache.get_usable_length`; `ddp_cache_data` still takes the per-layer
+        # `(key, value[, sliding_window])` tuples, and the length comes from `get_seq_length()`.
+        if past_key_values is None:
+            past_key_values = DynamicCache()
+        elif not isinstance(past_key_values, Cache):
+            past_key_values = DynamicCache(past_key_values)
+        past_key_values_length = past_key_values.get_seq_length()
 
     if position_ids is None:
         device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -214,72 +223,68 @@ def deepseek_v3_model_forward(
     else:
         inputs_embeds = hidden_states_internal
 
-    if self._use_flash_attention_2:
-        # 2d mask is passed through the layers
-        attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-    else:
-        # 4d mask is passed through the layers
-        attention_mask = _prepare_4d_causal_attention_mask(
-            attention_mask,
-            (batch_size, seq_length),
-            inputs_embeds,
-            past_key_values_length,
-        )
+    # v5 dropped `DeepseekV3Model._update_causal_mask` in favour of `create_causal_mask`, with
+    # `allow_is_causal_skip` left at its default: DeepSeek-v3 runs v5's native attention (the
+    # policy keeps `self_attn`), which lets the backend decide, and `_use_flash_attention_2` --
+    # the attribute the old manual dispatch read -- no longer exists.
+    attention_mask = create_causal_mask(
+        config=self.config,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        position_ids=position_ids,
+    )
 
     # embed positions
     hidden_states = inputs_embeds
 
     # decoder layers
-    all_hidden_states = () if output_hidden_states else None
-    all_self_attns = () if output_attentions else None
+    # Neither is accumulated by hand under v5: `DecoderLayer.forward` returns a bare tensor and
+    # `@capture_outputs` overwrites both fields afterwards. Accumulating would also give wrong
+    # results for v5's new "layer-index list" form of `output_hidden_states`.
+    all_hidden_states = None
+    all_self_attns = None
     next_decoder_cache = None
 
     if stage_index is not None:
         start_idx, end_idx = stage_index
     else:
         start_idx, end_idx = 0, len(self.layers)
+    position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
     for i, decoder_layer in enumerate(self.layers[start_idx:end_idx], start=start_idx):
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
+        if self.gradient_checkpointing:
+            # v5 moves the recompute decision into `GradientCheckpointingLayer.__call__`, driven by
+            # a per-layer flag (which is what `gradient_checkpointing_enable()` sets -- the flag
+            # relies on it). Calling `_gradient_checkpointing_func` directly, as before, now
+            # misaligns the trailing positional args and fails inside attention. Layer 0 keeps
+            # its old exemption.
+            decoder_layer.gradient_checkpointing = i > 0
 
-        if self.gradient_checkpointing and i > 0:
-            layer_outputs = self._gradient_checkpointing_func(
-                decoder_layer.__call__,
-                hidden_states,
-                attention_mask,
-                position_ids,
-                past_key_values,
-                output_attentions,
-                use_cache,
-            )
-        else:
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_values,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-            )
-
-        hidden_states = layer_outputs[0]
+        # Keyword names must match v5's `DeepseekV3DecoderLayer.forward`: the old `past_key_value=`
+        # (singular) and `output_attentions=` no longer exist and are swallowed by `**kwargs` --
+        # that is how the KV cache was being lost.
+        layer_outputs = decoder_layer(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            position_embeddings=position_embeddings,
+        )
+        # v5's `DeepseekV3DecoderLayer.forward` returns a bare tensor (v4 returned a tuple), so
+        # the old `layer_outputs[0]` would index into the batch dim instead.
+        hidden_states = layer_outputs
 
         if use_cache:
-            next_decoder_cache = layer_outputs[2 if output_attentions else 1]
-
-        if output_attentions:
-            all_self_attns += (layer_outputs[1],)
+            # v5 updates the passed-in `Cache` in place instead of returning it
+            next_decoder_cache = past_key_values
 
     if stage_manager is None or stage_manager.is_last_stage():
         hidden_states = self.norm(hidden_states)
 
-    # add hidden states from the last decoder layer
-    if output_hidden_states:
-        all_hidden_states += (hidden_states,)
-
     next_cache = None
     if use_cache:
-        next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
+        next_cache = next_decoder_cache
     if stage_manager is not None and not stage_manager.is_last_stage():
         return {
             "hidden_states_internal": hidden_states,
@@ -306,9 +311,11 @@ def deepseek_v3_for_causal_lm_forward(
     output_attentions: Optional[bool] = None,
     output_hidden_states: Optional[bool] = None,
     return_dict: Optional[bool] = None,
+    logits_to_keep: Union[int, torch.Tensor] = 0,
     stage_manager: Optional[PipelineStageManager] = None,
     stage_index: Optional[List[int]] = None,
     hidden_states_internal: Optional[torch.Tensor] = None,
+    **kwargs,
 ) -> Union[Tuple, CausalLMOutputWithPast]:
     r"""
     Args:
@@ -329,13 +336,23 @@ def deepseek_v3_for_causal_lm_forward(
     >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
     "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
     ```"""
+    # v5 moves `output_attentions` / `output_hidden_states` into `**kwargs`, so pull them back out
+    # here -- otherwise the same key travels both ways and collides on the way down.
+    output_attentions = kwargs.pop("output_attentions", output_attentions)
+    output_hidden_states = kwargs.pop("output_hidden_states", output_hidden_states)
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
     )
     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+    # These must be resolved booleans, never `None`: the downstream `@capture_outputs` wrapper
+    # tests `kwargs.get("output_attentions", config.output_attentions)`, and an explicit `None`
+    # does not fall back to the config -- it silently turns recording off.
     # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+    # `return_dict` is deliberately not forwarded: the wrapper pops it and unconditionally calls
+    # `outputs.to_tuple()` when it is False, but the non-last PP stage returns a plain dict, which
+    # has no `to_tuple`. The parameter below is therefore unreachable from outside, kept for API.
     outputs = deepseek_v3_model_forward(
         self.model,
         input_ids=input_ids,
@@ -346,7 +363,6 @@ def deepseek_v3_for_causal_lm_forward(
         use_cache=use_cache,
         output_attentions=output_attentions,
         output_hidden_states=output_hidden_states,
-        return_dict=return_dict,
         stage_manager=stage_manager,
         stage_index=stage_index,
         hidden_states_internal=hidden_states_internal,
@@ -356,7 +372,9 @@ def deepseek_v3_for_causal_lm_forward(
 
     hidden_states = outputs[0]
 
-    logits = self.lm_head(hidden_states)
+    # v5 addition: logits for the last `logits_to_keep` positions only (`0` = all, the old behaviour).
+    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    logits = self.lm_head(hidden_states[:, slice_indices, :])
     logits = logits.float()
 
     loss = None
