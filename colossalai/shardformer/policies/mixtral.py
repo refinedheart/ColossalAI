@@ -22,6 +22,8 @@ from colossalai.shardformer.layer import (
 from colossalai.shardformer.modeling.mixtral import (
     EPMixtralSparseMoeBlock,
     MixtralPipelineForwards,
+    MixtralTopKRouter1D,
+    MixtralTopKRouterWithGradAccum,
     get_mixtral_flash_attention_forward,
     get_mixtral_flash_attention_model_forward,
 )
@@ -152,8 +154,9 @@ class MixtralPolicy(Policy):
                         },
                     ),
                     SubModuleReplacementDescription(
-                        suffix="block_sparse_moe.gate",
-                        target_module=Linear1D_Col,
+                        # v5 把该子模块从 `block_sparse_moe` 改名为 `mlp`
+                        suffix="mlp.gate",
+                        target_module=MixtralTopKRouter1D,
                         kwargs={
                             "gather_output": True,
                             "fp8_communication": self.shard_config.fp8_communication,
@@ -199,8 +202,10 @@ class MixtralPolicy(Policy):
                         },
                     ),
                     SubModuleReplacementDescription(
-                        suffix="block_sparse_moe.gate",
-                        target_module=LinearWithGradAccum,
+                        # v5 把该子模块从 `block_sparse_moe` 改名为 `mlp`；
+                        # 且 gate 的 forward 契约是**三元组**，故不能用 `LinearWithGradAccum`
+                        suffix="mlp.gate",
+                        target_module=MixtralTopKRouterWithGradAccum,
                         kwargs={
                             "fp8_communication": self.shard_config.fp8_communication,
                             "use_zbv": use_zbv,
@@ -231,7 +236,12 @@ class MixtralPolicy(Policy):
             self.append_or_create_submodule_replacement(
                 description=[
                     SubModuleReplacementDescription(
-                        suffix="block_sparse_moe",
+                        # v5 改名：`block_sparse_moe` → `mlp`。
+                        # 注意：EP 路径**不止改名** —— v5 的 `mlp.experts` 已是融合 3D 参数
+                        # （`gate_up_proj` / `down_proj`），`EPMixtralSparseMoeBlock` 依赖的
+                        # `num_experts` / `experts[i:j]` / `expert.w1,w2,w3` / `gate()` 返回 logits
+                        # **四项在 v5 下均不成立**，需结构性重做（见 docs/27 §三 N32，待 P4/P5）
+                        suffix="mlp",
                         target_module=EPMixtralSparseMoeBlock,
                         kwargs={
                             "ep_group": self.shard_config.ep_group,

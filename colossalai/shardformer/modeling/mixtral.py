@@ -8,13 +8,11 @@ import torch.nn.functional as F
 from torch.distributed import ProcessGroup
 from torch.nn import CrossEntropyLoss
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.modeling_attn_mask_utils import (
-    _prepare_4d_causal_attention_mask,
-    _prepare_4d_causal_attention_mask_for_sdpa,
-)
+from transformers.masking_utils import create_causal_mask
 from transformers.models.mixtral.modeling_mixtral import (
     MixtralModel,
     MixtralSparseMoeBlock,
+    MixtralTopKRouter,
     MoeCausalLMOutputWithPast,
     MoeModelOutputWithPast,
     apply_rotary_pos_emb,
@@ -22,6 +20,7 @@ from transformers.models.mixtral.modeling_mixtral import (
     repeat_kv,
 )
 from transformers.utils import is_flash_attn_2_available, logging
+from transformers.utils.output_capturing import capture_outputs
 
 from colossalai.lazy import LazyInitContext
 from colossalai.moe._operation import (
@@ -38,7 +37,7 @@ from colossalai.shardformer.layer._operation import (
     gather_forward_split_backward,
     split_forward_gather_backward,
 )
-from colossalai.shardformer.layer.linear import Linear1D_Col, Linear1D_Row, ParallelModule
+from colossalai.shardformer.layer.linear import Linear1D_Col, Linear1D_Row, LinearWithGradAccum, ParallelModule
 from colossalai.shardformer.shard import ShardConfig
 from colossalai.shardformer.shard.utils import set_tensors_to_none
 from colossalai.tensor.moe_tensor.api import set_moe_tensor_ep_group
@@ -49,6 +48,125 @@ if is_flash_attn_2_available():
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
     _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
+
+
+class _MixtralTopKRouterMixin:
+    r"""Sharded / grad-accumulation variants of the v5 ``MixtralTopKRouter``.
+
+    Only the matmul is replaced; the post-processing matches v5's
+    ``MixtralTopKRouter.forward`` line for line.
+
+    Args:
+        hidden_dim (int): second dimension of the router weight, used to reshape the input
+            into ``(N, hidden_dim)``.
+        top_k (int): number of experts selected per token.
+
+    v5 collects `router_logits` declaratively: `MixtralModel._can_record_outputs` declares
+    `OutputRecorder(MixtralTopKRouter, index=0)` and the capturing hook is matched with
+    `isinstance` (`output_capturing.py:165`). Both subclasses below therefore also inherit from
+    `MixtralTopKRouter`, so the hook attaches to the sharded router as well and records the first
+    element of its (logits, scores, indices) triple. No extra communication is needed for that:
+    `Linear1D_Col` runs with `gather_output=True`, so the expert dimension of the logits is already
+    gathered back on every rank.
+    """
+
+    def forward(self, hidden_states: torch.Tensor):
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        router_logits = super().forward(hidden_states)
+        router_probs = F.softmax(router_logits.float(), dim=-1)
+        router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)
+        router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
+        return router_logits, router_top_value, router_indices
+
+
+# `MixtralTopKRouter` is the last base on purpose: it is only there for the `isinstance` match of
+# v5's capturing hook. The mixin must come first so that `super().forward()` inside it reaches
+# `Linear1D_Col.forward` (sharded matmul + gather); putting the native router before the parallel
+# linear would silently take v5's `F.linear` path instead, i.e. topk over a single rank's experts.
+class MixtralTopKRouter1D(_MixtralTopKRouterMixin, Linear1D_Col, MixtralTopKRouter):
+    r"""Tensor-parallel Mixtral router.
+
+    v5 replaced ``MixtralSparseMoeBlock.gate`` with ``MixtralTopKRouter`` and unpacks a triple
+    from it::
+
+        _, top_k_weights, top_k_index = self.gate(hidden_states)
+
+    ``Linear1D_Col`` returns a single tensor, so substituting it directly would silently compute
+    the wrong thing: unpacking an ``[N, E]`` output iterates over dim 0 (the tokens), which raises
+    only when ``N == 3``. This class keeps the weight sharded over the expert dimension while
+    matching v5's forward contract.
+
+    The weight stays under the name ``weight`` (the sharding writes back in place), so the state
+    dict key ``...mlp.gate.weight`` matches v5's HF key.
+
+    Inherits from `MixtralTopKRouter` so that v5's output-capturing hook recognises it; see the
+    mixin docstring for why that is the only requirement (the logits are already gathered).
+    """
+
+    @staticmethod
+    def from_native_module(
+        module: "MixtralTopKRouter", process_group: ProcessGroup = None, **kwargs
+    ) -> "MixtralTopKRouter1D":
+        r"""Convert a native ``MixtralTopKRouter`` to a tensor-parallel one.
+
+        Args:
+            module (MixtralTopKRouter): the native router to be converted.
+            process_group (ProcessGroup): the process group of tensor parallelism.
+            **kwargs: passed to ``Linear1D_Col`` (e.g. ``fp8_communication`` / ``use_zbv``).
+        """
+        LazyInitContext.materialize(module)
+
+        top_k, hidden_dim = module.top_k, module.hidden_dim
+        num_experts, in_features = module.weight.shape
+
+        tp_size = dist.get_world_size(process_group) if process_group is not None else 1
+        if num_experts < tp_size:
+            # Same as `Linear1D_Col.from_native_module` (linear.py:301-303): skip sharding when it
+            # would not divide evenly.
+            return module
+
+        # `Linear1D_Col` shards by writing back in place (`sharded_tensor_to_existing_param`), so
+        # the router's own `Parameter` ends up holding the shard.
+        shim = torch.nn.Linear(in_features, num_experts, bias=False)
+        shim.weight = module.weight
+
+        kwargs = dict(kwargs)
+        kwargs.setdefault("gather_output", True)
+        router = Linear1D_Col.from_native_module(shim, process_group, **kwargs)
+        router.__class__ = MixtralTopKRouter1D
+        router.top_k = top_k
+        router.hidden_dim = hidden_dim
+        return router
+
+
+class MixtralTopKRouterWithGradAccum(_MixtralTopKRouterMixin, LinearWithGradAccum, MixtralTopKRouter):
+    r"""Mixtral router for Zero-Bubble-V (``use_zbv``, no TP).
+
+    Same reasoning as ``MixtralTopKRouter1D``: the ZBV branch used to substitute
+    ``LinearWithGradAccum`` for the gate, which breaks v5's triple contract in the same way. Only
+    the matmul is swapped, and nothing is sharded, so the logits keep v5's shapes.
+
+    Inherits from `MixtralTopKRouter` so that v5's output-capturing hook recognises it; see the
+    mixin docstring for why that is the only requirement (nothing is sharded here, so the logits
+    are complete by construction).
+    """
+
+    @staticmethod
+    def from_native_module(module: "MixtralTopKRouter", **kwargs) -> "MixtralTopKRouterWithGradAccum":
+        r"""Convert a native ``MixtralTopKRouter`` to a grad-accumulation one."""
+        LazyInitContext.materialize(module)
+
+        top_k, hidden_dim = module.top_k, module.hidden_dim
+        num_experts, in_features = module.weight.shape
+
+        shim = torch.nn.Linear(in_features, num_experts, bias=False)
+        shim.weight = module.weight
+
+        router = LinearWithGradAccum.from_native_module(shim, **kwargs)
+        router.__class__ = MixtralTopKRouterWithGradAccum
+        router.top_k = top_k
+        router.hidden_dim = hidden_dim
+        return router
 
 
 class EPMixtralSparseMoeBlock(ParallelModule):
@@ -265,7 +383,6 @@ class MixtralPipelineForwards:
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
-
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -306,7 +423,9 @@ class MixtralPipelineForwards:
             use_cache = False
 
         if past_key_values is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
+            # v5's `past_key_values` is a `Cache` object and not subscriptable; the old
+            # `past_key_values[0][0].shape[2]` only worked on v4's legacy tuple.
+            past_key_values_length = past_key_values.get_seq_length()
             seq_length_with_past = seq_length_with_past + past_key_values_length
 
         if position_ids is None:
@@ -326,13 +445,15 @@ class MixtralPipelineForwards:
             # 2d mask is passed through the layers
             attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
         else:
-            # 4d mask is passed through the layers
-            attention_mask = _prepare_4d_causal_attention_mask(
-                attention_mask,
-                (batch_size, seq_length),
-                hidden_states,
-                past_key_values_length,
-                sliding_window=self.config.sliding_window,
+            # v5 deprecates `_prepare_4d_causal_attention_mask*`; `create_causal_mask` covers both
+            # the sdpa and the eager branch.
+            attention_mask = create_causal_mask(
+                config=self.config,
+                inputs_embeds=hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+                allow_is_causal_skip=False,
             )
 
         if self.gradient_checkpointing and self.training:
@@ -347,7 +468,6 @@ class MixtralPipelineForwards:
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-        all_router_logits = () if output_router_logits else None
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
@@ -355,53 +475,70 @@ class MixtralPipelineForwards:
             )
 
         start_idx, end_idx = stage_index[0], stage_index[1]
-        for idx, decoder_layer in enumerate(self.layers[start_idx:end_idx], start=start_idx):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
 
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
+        # v5 collects router logits declaratively and activates the collector per call: wrapping only
+        # this stage's layer loop in `capture_outputs` yields exactly this stage's logits, which
+        # `past_router_logits` then accumulates across stages (as in v4).
+        @capture_outputs
+        def _local_layers_forward(
+            _model,
+            hidden_states,
+            *,
+            output_hidden_states=False,
+            output_attentions=False,
+            output_router_logits=False,
+        ):
+            r"""Run this stage's layers. `_model` only exists so that `capture_outputs` can reach
+            `_can_record_outputs` and install the hooks; the closure's `self` does the work."""
+            local_hidden_states = () if output_hidden_states else None
+            local_self_attns = () if output_attentions else None
+            next_decoder_cache = None
+            for idx, decoder_layer in enumerate(self.layers[start_idx:end_idx], start=start_idx):
+                if output_hidden_states:
+                    local_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
+                # The cache is updated in place per layer; gradient checkpointing is handled by
+                # `GradientCheckpointingLayer.__call__`.
+                if self.gradient_checkpointing and self.training:
+                    decoder_layer.gradient_checkpointing = True
 
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        # None for past_key_value
-                        return module(*inputs)
-
-                    return custom_forward
-
-                layer_outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(decoder_layer),
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    None,
-                    output_attentions,
-                    output_router_logits,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                )
-            else:
                 layer_outputs = decoder_layer(
                     hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_value,
-                    output_attentions,
-                    output_router_logits,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    position_embeddings=position_embeddings,
                 )
-            hidden_states = layer_outputs[0]
+                # v5's `DecoderLayer.forward` returns a bare tensor (v4 returned a tuple)
+                hidden_states = layer_outputs
 
-            if use_cache:
-                next_decoder_cache = (layer_outputs[2 if output_attentions else 1],)
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-            if output_router_logits:
-                all_router_logits += (layer_outputs[-1],)
+                if use_cache:
+                    next_decoder_cache = past_key_values
+
+            return MoeModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=next_decoder_cache,
+                hidden_states=local_hidden_states,
+                attentions=local_self_attns,
+            )
+
+        local_outputs = _local_layers_forward(
+            self,
+            hidden_states,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            output_router_logits=output_router_logits,
+        )
+        hidden_states = local_outputs.last_hidden_state
+        all_hidden_states = local_outputs.hidden_states
+        all_self_attns = local_outputs.attentions
+        next_decoder_cache = local_outputs.past_key_values
+        # `capture_outputs` writes `outputs[key] = tuple(collected)` unconditionally, so "nothing
+        # collected" is an empty tuple, not None -- and `load_balancing_loss_func((), ...)` raises
+        # `IndexError` on `gate_logits[0]`. Normalise empty to None here; None returns 0 there.
+        local_router_logits = tuple(local_outputs.router_logits) if local_outputs.router_logits else None
+        all_router_logits = local_router_logits if output_router_logits else None
 
         if stage_manager.is_last_stage():
             hidden_states = self.norm(hidden_states)
@@ -412,7 +549,8 @@ class MixtralPipelineForwards:
         next_cache = next_decoder_cache if use_cache else None
 
         if output_router_logits and past_router_logits is not None:
-            all_router_logits = past_router_logits + all_router_logits
+            # `all_router_logits` is None when this stage collected none (see above).
+            all_router_logits = past_router_logits + (all_router_logits or ())
 
         if stage_manager.is_last_stage():
             if not return_dict:
@@ -540,9 +678,15 @@ class MixtralPipelineForwards:
                 shift_labels = shift_labels.to(shift_logits.device)
                 loss = loss_fct(shift_logits, shift_labels)
 
+            # Read by field name, not by position: v5's `ModelOutput` only stores non-None fields,
+            # so `outputs[-1]` silently degenerates to `hidden_states` whenever `router_logits` is
+            # absent (the field-level read yields the class default `None` instead, which is what
+            # `load_balancing_loss_func` wants).
+            router_logits = outputs.router_logits if output_router_logits else None
+
             aux_loss = None
             if output_router_logits:
-                aux_loss = load_balancing_loss_func(outputs[-1], self.num_experts, self.num_experts_per_tok)
+                aux_loss = load_balancing_loss_func(router_logits, self.num_experts, self.num_experts_per_tok)
                 if labels is not None:
                     loss += self.router_aux_loss_coef * aux_loss
 
@@ -559,7 +703,7 @@ class MixtralPipelineForwards:
                 past_key_values=None,
                 hidden_states=outputs[0],
                 attentions=None,
-                router_logits=outputs[-1],
+                router_logits=router_logits,
             )
         else:
             out = {}
@@ -581,7 +725,9 @@ def get_mixtral_flash_attention_forward(shard_config, sp_mode=None, sp_size=None
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        # Keep the plural name: v5's call sites pass `past_key_values=`, so a singular parameter
+        # would swallow it into `**kwargs` and silently disable the KV cache.
+        past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         use_cache: bool = False,
@@ -601,6 +747,12 @@ def get_mixtral_flash_attention_forward(shard_config, sp_mode=None, sp_size=None
             # overwrite attention_mask with padding_mask
             attention_mask = kwargs.pop("padding_mask")
         bsz, q_len, _ = hidden_states.size()
+        # v5's `MixtralAttention` has no `num_heads` / `num_key_value_heads` attributes of its own
+        # and reads the config directly. Only the TP and SP-all_to_all policies write those names,
+        # so a plain SP run would hit an `AttributeError` on `self.num_heads` -- hence the fallback.
+        num_heads = getattr(self, "num_heads", None) or self.config.num_attention_heads
+        num_key_value_heads = getattr(self, "num_key_value_heads", None) or self.config.num_key_value_heads
+        hidden_size = getattr(self, "hidden_size", None) or self.config.hidden_size
 
         # sp: modify sp_len when sequence parallel mode is ring
         if sp_mode in ["split_gather", "ring"]:
@@ -617,18 +769,15 @@ def get_mixtral_flash_attention_forward(shard_config, sp_mode=None, sp_size=None
             value_states = all_to_all_comm(value_states, sp_group, fp8_communication=shard_config.fp8_communication)
             bsz, q_len, _ = query_states.size()
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            if self.layer_idx is None:
-                raise ValueError(
-                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-                    "with a layer index."
-                )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        query_states = query_states.view(bsz, q_len, num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, num_key_value_heads, self.head_dim).transpose(1, 2)
+        if past_key_values is not None and self.layer_idx is None:
+            raise ValueError(
+                f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                "with a layer index."
+            )
 
         # Because the input can be padded, the absolute sequence length depends on the max position id.
         cos, sin = position_embeddings
@@ -640,9 +789,10 @@ def get_mixtral_flash_attention_forward(shard_config, sp_mode=None, sp_size=None
                 "The current flash attention version does not support sliding window attention, for a more memory efficient implementation"
                 " make sure to upgrade flash-attn library."
             )
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        if past_key_values is not None:
+            # v5 dropped `Cache.get_usable_length`; `update` now returns the full (history
+            # included) k/v, matching v5's own `MixtralAttention`.
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -700,12 +850,12 @@ def get_mixtral_flash_attention_forward(shard_config, sp_mode=None, sp_size=None
 
         # sp: all-to-all comminucation when introducing sequence parallel
         if sp_mode == "all_to_all":
-            attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim).contiguous()  # (1, 8, 128)
+            attn_output = attn_output.reshape(bsz, q_len, num_heads * self.head_dim).contiguous()  # (1, 8, 128)
             attn_output = all_to_all_comm(
                 attn_output, sp_group, scatter_dim=1, gather_dim=2, fp8_communication=shard_config.fp8_communication
             )  # (1, 4, 256)
         else:
-            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+            attn_output = attn_output.reshape(bsz, q_len, hidden_size)
 
         attn_output = self.o_proj(attn_output)
 
@@ -719,6 +869,10 @@ def get_mixtral_flash_attention_forward(shard_config, sp_mode=None, sp_size=None
 def get_mixtral_flash_attention_model_forward(shard_config, sp_mode=None, sp_size=None, sp_group=None):
     logger = logging.get_logger(__name__)
 
+    # v5 collects `router_logits` declaratively (`OutputRecorder(MixtralTopKRouter, index=0)` in
+    # `MixtralModel._can_record_outputs`) and injects it via `@capture_outputs`. v5's own forward
+    # carries that decorator and ours replaces it, so it has to be put back here.
+    @capture_outputs
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -763,10 +917,15 @@ def get_mixtral_flash_attention_model_forward(shard_config, sp_mode=None, sp_siz
                 )
                 use_cache = False
         if use_cache:
-            use_legacy_cache = not isinstance(past_key_values, Cache)
-            if use_legacy_cache:
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            past_key_values_length = past_key_values.get_usable_length(seq_length)
+            # v5 dropped `DynamicCache.from_legacy_cache` / `to_legacy_cache`, but the
+            # `ddp_cache_data` argument of `DynamicCache.__init__` is exactly the per-layer
+            # `(key, value[, sliding_window])` tuples, so constructing it is the old semantics.
+            if past_key_values is None:
+                past_key_values = DynamicCache()
+            elif not isinstance(past_key_values, Cache):
+                past_key_values = DynamicCache(past_key_values)
+            # v5 dropped `Cache.get_usable_length` in favour of `get_seq_length`.
+            past_key_values_length = past_key_values.get_seq_length()
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -791,23 +950,18 @@ def get_mixtral_flash_attention_model_forward(shard_config, sp_mode=None, sp_siz
         if self.config._attn_implementation == "flash_attention_2":
             # 2d mask is passed through the layers
             attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-        elif self._attn_implementation == "sdpa" and not output_attentions:
-            # output_attentions=True can not be supported when using SDPA, and we fall back on
-            # the manual implementation that requires a 4D causal mask in all cases.
-            attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
-                attention_mask,
-                (batch_size, seq_length),
-                inputs_embeds,
-                past_key_values_length,
-            )
         else:
-            # 4d mask is passed through the layers
-            attention_mask = _prepare_4d_causal_attention_mask(
-                attention_mask,
-                (batch_size, seq_length),
-                inputs_embeds,
-                past_key_values_length,
-                sliding_window=self.config.sliding_window,
+            # v5 deprecates `modeling_attn_mask_utils._prepare_4d_causal_attention_mask*` in
+            # favour of `create_causal_mask`, which also folds in the sdpa / eager split and
+            # sliding window. `allow_is_causal_skip=False` because this branch ends in explicit
+            # softmax rather than delegating causality to the backend.
+            attention_mask = create_causal_mask(
+                config=self.config,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+                allow_is_causal_skip=False,
             )
 
         if sp_mode in ["ring", "split_gather"]:
@@ -833,49 +987,36 @@ def get_mixtral_flash_attention_model_forward(shard_config, sp_mode=None, sp_siz
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-        all_router_logits = () if output_router_logits else None
         next_decoder_cache = None
 
         for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            # v5 hands gradient checkpointing to `GradientCheckpointingLayer.__call__`, but
+            # `_gradient_checkpointing_func` is still required (it is called there) and is only
+            # installed by going through `gradient_checkpointing_enable()` -- hence the flag.
             if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    output_router_logits,
-                    use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    output_router_logits=output_router_logits,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                )
+                decoder_layer.gradient_checkpointing = True
 
-            hidden_states = layer_outputs[0]
+            # Keyword names follow v5's `MixtralDecoderLayer.forward`. The old positional call
+            # fails outright (7 args against 6 parameters), and would misalign `position_embeddings`
+            # even if the count matched, since v5 puts it second.
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                position_embeddings=position_embeddings,
+            )
+
+            # v5's `DecoderLayer.forward` returns a bare tensor (v4 returned a tuple)
+            hidden_states = layer_outputs
 
             if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
-
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-
-            if output_router_logits:
-                all_router_logits += (layer_outputs[-1],)
+                # v5 updates the passed-in `Cache` in place instead of returning it
+                next_decoder_cache = past_key_values
 
         hidden_states = self.norm(hidden_states)
 
@@ -894,20 +1035,19 @@ def get_mixtral_flash_attention_model_forward(shard_config, sp_mode=None, sp_siz
 
         next_cache = None
         if use_cache:
-            next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
+            # v5 dropped `to_legacy_cache`: the cache comes back as a `Cache` object, as v5
+            # itself does, no longer downgraded to a legacy tuple to match the input.
+            next_cache = next_decoder_cache
 
         if not return_dict:
-            return tuple(
-                v
-                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_router_logits]
-                if v is not None
-            )
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-            router_logits=all_router_logits,
+            # Left to the `@capture_outputs` decorator (see the top of this function).
+            router_logits=None,
         )
 
     return forward
