@@ -17,7 +17,6 @@ from transformers.models.mixtral.modeling_mixtral import (
     MoeModelOutputWithPast,
     apply_rotary_pos_emb,
     load_balancing_loss_func,
-    repeat_kv,
 )
 from transformers.utils import is_flash_attn_2_available, logging
 from transformers.utils.output_capturing import capture_outputs
@@ -40,6 +39,11 @@ from colossalai.shardformer.layer._operation import (
 from colossalai.shardformer.layer.linear import Linear1D_Col, Linear1D_Row, LinearWithGradAccum, ParallelModule
 from colossalai.shardformer.shard import ShardConfig
 from colossalai.tensor.moe_tensor.api import set_moe_tensor_ep_group
+
+# v4-era flag, read by `get_mixtral_flash_attention_forward` for a one-off warning. It is only
+# populated below when flash-attn is actually installed; default to "supported" so the reference
+# stays in scope (and no spurious sliding-window warning fires) on flash-attn-free environments.
+_flash_supports_window_size = True
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func
@@ -117,6 +121,14 @@ class MixtralTopKRouter1D(_MixtralTopKRouterMixin, Linear1D_Col, MixtralTopKRout
 
         top_k, hidden_dim = module.top_k, module.hidden_dim
         num_experts, in_features = module.weight.shape
+
+        # Under sequence parallelism (split_gather / ring / all_to_all) the sequence — not the batch
+        # — is split across the TP ranks, so the standard expert-dim gather below would pair each
+        # local token with a *different* rank's local token. The router weight is tiny
+        # ([num_experts, hidden]), so keep it unsharded: the native forward already computes the full
+        # logits for the local tokens, and no gather is needed.
+        if kwargs.get("seq_parallel_mode", None) is not None:
+            return module
 
         tp_size = dist.get_world_size(process_group) if process_group is not None else 1
         if num_experts < tp_size:
@@ -800,11 +812,10 @@ def get_mixtral_flash_attention_forward(shard_config, sp_mode=None, sp_size=None
             # included) k/v, matching v5's own `MixtralAttention`.
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-        0.0 if not self.training else self.attention_dropout
-
+        # v5's `eager_attention_forward` / `sdpa_attention_forward` both do their own `repeat_kv`
+        # (keyed on `num_key_value_groups`) and expect q/k/v in `[bsz, heads, q_len, head_dim]`.
+        # The v4 leftovers here -- an explicit `repeat_kv` plus a `transpose(1, 2)` before the
+        # interface -- double-count the head dim and shift the sequence into the head axis.
         # In PEFT, usually we cast the layer norms in float32 for training stability reasons
         # therefore the input hidden states gets silently casted in float32. Hence, we need
         # cast them back in float16 just to be sure everything works as expected.
@@ -827,10 +838,6 @@ def get_mixtral_flash_attention_forward(shard_config, sp_mode=None, sp_size=None
             query_states = query_states.to(target_dtype)
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
-        # Reashape to the expected shape for Flash Attention
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
