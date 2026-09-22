@@ -36,12 +36,11 @@ class DeepseekV3Policy(Policy):
 
         if self.shard_config.expert_parallel_size > 1:
             # expert parallel
-            # 三原语重写已落地（docs/30 §四，与 Mixtral 的 `EPMixtralSparseMoeBlock` 同款）：① 布局切片
-            # （`setup_process_groups` 把融合 3D `gate_up_proj`/`down_proj` 按专家维 `.clone()` 切成本卡
-            # 份额）；② 加载映射（`set_moe_tensor_ep_group`）；③ per-expert 调用（`_expert_forward`）。
-            # 与 Mixtral 不同的是这里只换 `mlp` 整块、没有单独的 `gate` 替换点，且前
-            # `first_k_dense_replace` 层是 dense `DeepseekV3MLP`（`from_native_module` 里按类名跳过）。
-            # 纯 EP（tp=1）已就绪，待 4 卡 GPU 验收。
+            # The v5 EP path uses three primitives (see docs/30 §4): slice fused expert parameters,
+            # mark their EP loading group, and run each local expert with fused matmuls.
+            # Unlike Mixtral, this policy replaces the whole `mlp`; dense layers before
+            # `first_k_dense_replace` are skipped by `from_native_module`.
+            # Pure EP (tp=1) is implemented; 4-GPU acceptance is pending.
             self.append_or_create_submodule_replacement(
                 description=[
                     SubModuleReplacementDescription(
