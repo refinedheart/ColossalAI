@@ -700,7 +700,13 @@ class MixtralPipelineForwards:
             # so `outputs[-1]` silently degenerates to `hidden_states` whenever `router_logits` is
             # absent (the field-level read yields the class default `None` instead, which is what
             # `load_balancing_loss_func` wants).
-            router_logits = outputs.router_logits if output_router_logits else None
+            if output_router_logits:
+                # `mixtral_model_forward` returns a tuple when `return_dict=False`; in that
+                # form `router_logits` is the final non-None entry (see its tuple construction
+                # above).  Field access is only valid for the ModelOutput form.
+                router_logits = outputs.router_logits if return_dict else outputs[-1]
+            else:
+                router_logits = None
 
             aux_loss = None
             if output_router_logits:
