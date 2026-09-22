@@ -174,6 +174,13 @@ _POLICY_LIST = {
     "transformers_modules.modeling_deepseek.DeepseekV3ForCausalLM": PolicyLocation(
         file_name="deepseek_v3", class_name="DeepseekV3ForCausalLMPolicy"
     ),
+    # DeepSeek-v3 in transformers v5 is a built-in model rather than a custom `transformers_modules` model.
+    "transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3Model": PolicyLocation(
+        file_name="deepseek_v3", class_name="DeepseekV3ModelPolicy"
+    ),
+    "transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3ForCausalLM": PolicyLocation(
+        file_name="deepseek_v3", class_name="DeepseekV3ForCausalLMPolicy"
+    ),
     # Falcon
     "transformers.models.falcon.modeling_falcon.FalconModel": PolicyLocation(
         file_name="falcon", class_name="FalconModelPolicy"
