@@ -1,31 +1,34 @@
-r"""ColossalAI 内部使用的 transformers 版本兼容垫片（**不对外导出**）。
+r"""Internal transformers compatibility shim for ColossalAI (not exported).
 
-背景
-----
-ColossalAI 把 transformers 钉在 ``==4.51.3``（``requirements/requirements.txt``）。
-迁移到 v5 时，一批被引用的 transformers 内部符号发生了变化，分两类：
+Background
+----------
+ColossalAI pins transformers to ``==4.51.3`` (``requirements/requirements.txt``).
+During the migration to v5, several referenced transformers internals changed in two ways:
 
-1. **换位置** —— 如 ``no_init_weights`` 从 ``transformers.modeling_utils``
-   搬到 ``transformers.initialization``；
-2. **被删除** —— 如 ``is_remote_url`` / ``download_url`` / ``is_safetensors_available``
-   在 v5 的 transformers 安装树里均**已 0 处残留**（见 ``scripts/N11_symbol_relocation_probe.py``）。
+1. **Moved** — for example, ``no_init_weights`` moved from ``transformers.modeling_utils``
+   to ``transformers.initialization``.
+2. **Removed** — ``is_remote_url`` / ``download_url`` / ``is_safetensors_available``
+   have no remaining definitions in the v5 transformers installation tree
+   (see ``scripts/N11_symbol_relocation_probe.py``).
 
-本模块把这两类差异收敛到一处，避免版本分支散落到 ``lazy`` / ``shardformer`` /
-``checkpoint_io`` 各处。
+This module centralizes both differences so version-specific branches do not spread across
+``lazy`` / ``shardformer`` / ``checkpoint_io``.
 
-约定（沿用本仓库既有风格，不是新引入的模式）
-------------------------------------------
-* **优先特性检测，不优先版本号字符串**：换位置类的差异一律用 ``try/except ImportError``
-  双路径导入，天然同时覆盖 v4 与 v5，不依赖 ``transformers.__version__`` 的解析。
-  仓库既有先例：``shardformer/policies/qwen2.py`` 用
-  ``hasattr(self.model.config, "num_key_value_heads")`` 做特性检测。
-* **能力被删除时不静默改语义**：返回 ``None`` 让调用点显式处理，由调用点抛出
-  **带解释的报错**，而不是悄悄退化成另一种行为。
-* **import 本模块无副作用**：不在模块顶层导入 transformers 的重物、不打日志 ——
-  与 ``shardformer/_utils.py`` 同一规矩，``get_*`` 一律函数式惰性取用。
+Conventions (following existing repository style, not introducing a new pattern)
+----------------------------------------------------------------------------------
+* **Prefer feature detection over version strings**: moved symbols use two
+  ``try/except ImportError`` import paths, covering v4 and v5 without parsing
+  ``transformers.__version__``. An existing example is
+  ``shardformer/policies/qwen2.py``, which uses
+  ``hasattr(self.model.config, "num_key_value_heads")`` for feature detection.
+* **Do not silently change semantics when a capability is removed**: return ``None`` and
+  let the call site handle it explicitly and raise an explanatory error.
+* **Importing this module has no side effects**: do not import heavyweight transformers
+  modules or log at module scope. As with ``shardformer/_utils.py``, all ``get_*`` helpers
+  resolve dependencies lazily inside functions.
 
-用法
-----
+Usage
+-----
     from colossalai._compat import get_no_init_weights, is_safetensors_available
 
     with get_no_init_weights()():
@@ -39,18 +42,18 @@ from inspect import signature
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlparse
 
-# `get_auth_kwarg_name` 的结果缓存（惰性求值，避免每次加载模型都做一次签名内省）
+# Cache the result of `get_auth_kwarg_name` lazily to avoid inspecting the signature per load.
 _AUTH_KWARG_NAME: Optional[str] = None
 
 
 def get_no_init_weights() -> Callable[[], Any]:
-    r"""取得 ``no_init_weights`` 上下文管理器工厂。
+    r"""Return the ``no_init_weights`` context-manager factory.
 
-    transformers v5 把 ``no_init_weights`` 定义在 ``transformers.initialization``
-    （v5.17.0 实测：``initialization.py:254``）；v4 在 ``transformers.modeling_utils``。
+    Transformers v5 defines ``no_init_weights`` in ``transformers.initialization``
+    (v5.17.0: ``initialization.py:254``); v4 keeps it in ``transformers.modeling_utils``.
 
     Returns:
-        Callable[[], Any]: 无参可调用对象，返回一个上下文管理器。
+        Callable[[], Any]: A no-argument callable that returns a context manager.
     """
     try:
         from transformers.initialization import no_init_weights as _fn
@@ -60,18 +63,19 @@ def get_no_init_weights() -> Callable[[], Any]:
 
 
 def is_safetensors_available() -> bool:
-    r"""``safetensors`` 是否可用。
+    r"""Return whether ``safetensors`` is available.
 
-    v4 由 ``transformers.utils.is_safetensors_available`` 提供；v5 该函数已删除
-    （safetensors 转为硬依赖），退化为 ``importlib`` 探测。
+    v4 provides ``transformers.utils.is_safetensors_available``; v5 removed that helper
+    because safetensors became a hard dependency, so this falls back to ``importlib``.
 
-    注意：本仓库另有一份同名实现 ``colossalai/checkpoint_io/utils.py:62``，
-    其函数体是 ``try: return True / except ImportError: return False``，
-    恒为 ``True``（是早期模块级 import 的遗留）。此处不复用那一份，以免把
-    「有没有 safetensors」的探测变成常量返回。
+    The repository also has a same-named implementation at
+    ``colossalai/checkpoint_io/utils.py:62``. Its body is
+    ``try: return True / except ImportError: return False`` and therefore always returns
+    ``True`` (a remnant of an early module-level import). Do not reuse it here, or the
+    availability check would become a constant.
 
     Returns:
-        bool: 可用为 ``True``。
+        bool: ``True`` when the package is available.
     """
     try:
         from transformers.utils import is_safetensors_available as _fn
@@ -81,35 +85,35 @@ def is_safetensors_available() -> bool:
 
 
 def is_remote_url(url_or_filename: str) -> bool:
-    r"""判断给定字符串是否是裸 URL（``http`` / ``https``）。
+    r"""Return whether a string is a raw URL (``http`` / ``https``).
 
-    该符号在 transformers v5 已删除，此处按 v4 语义就地实现（v4 的实现同为
-    ``urlparse(...).scheme in ("http", "https")``）。保留它的用途是**给出解释性报错**，
-    详见 :func:`get_download_url`。
+    Transformers v5 removed this symbol, so it is implemented here with the v4 semantics
+    (the v4 implementation also checks ``urlparse(...).scheme in ("http", "https")``).
+    It is retained to support an explanatory error; see :func:`get_download_url`.
 
     Args:
-        url_or_filename (str): 待判断的路径或 URL。
+        url_or_filename (str): Path or URL to inspect.
 
     Returns:
-        bool: 是裸 URL 为 ``True``。
+        bool: ``True`` when the input is a raw URL.
     """
     return urlparse(str(url_or_filename)).scheme in ("http", "https")
 
 
 def get_download_url() -> Optional[Callable[..., str]]:
-    r"""取得「从裸 URL 下载权重」的实现。
+    r"""Return the implementation for downloading weights from a raw URL.
 
-    v4 返回 ``transformers.modeling_utils.download_url``；**v5 已删除该能力**——
-    ``download_url`` 与 ``is_remote_url`` 在 v5 安装树里 0 处残留，
-    ``transformers.utils.hub.cached_file`` 的签名也收缩为
-    ``(path_or_repo_id, filename, **kwargs)``，不再接受 URL。
+    v4 returns ``transformers.modeling_utils.download_url``. **v5 removed this
+    capability**: ``download_url`` and ``is_remote_url`` have no remaining definitions,
+    and ``transformers.utils.hub.cached_file`` now accepts
+    ``(path_or_repo_id, filename, **kwargs)`` rather than URLs.
 
-    因此 v5 下返回 ``None``。调用点必须显式处理 ``None``（抛带解释的报错），
-    不要静默落到「把它当 repo id 去缓存里找」的分支 —— 那样用户拿到的是
-    一个看不出真实原因的 ``OSError``。
+    Therefore this returns ``None`` under v5. Callers must handle ``None`` explicitly and
+    raise an explanatory error instead of silently treating the URL as a repository ID,
+    which would expose an opaque ``OSError``.
 
     Returns:
-        Optional[Callable[..., str]]: v4 为可调用对象，v5 为 ``None``。
+        Optional[Callable[..., str]]: The v4 callable, or ``None`` under v5.
     """
     try:
         from transformers.modeling_utils import download_url as _fn
@@ -119,33 +123,32 @@ def get_download_url() -> Optional[Callable[..., str]]:
 
 
 def get_auth_kwarg_name() -> str:
-    r"""取得当前 transformers 版本使用的**认证参数名**。
+    r"""Return the authentication parameter name used by the installed transformers.
 
-    v5 把 ``use_auth_token`` 改名成 ``token``。实测（v5.17.0，4/4 入口）：
+    v5 renamed ``use_auth_token`` to ``token``. On v5.17.0, all four relevant entry points
+    expose ``token`` and no longer expose ``use_auth_token``:
 
-    ==========================================  ================  =======
-    入口                                        use_auth_token    token
-    ==========================================  ================  =======
-    ``PretrainedConfig.from_pretrained``        无                有
-    ``GenerationConfig.from_pretrained``        无                有
-    ``transformers.utils.hub.has_file``         无                有
-    ``transformers.utils.hub.cached_file``      无                有
-    ==========================================  ================  =======
+    * ``PretrainedConfig.from_pretrained``
+    * ``GenerationConfig.from_pretrained``
+    * ``transformers.utils.hub.has_file``
+    * ``transformers.utils.hub.cached_file``
 
-    ``cached_file`` 自身是 ``(path_or_repo_id, filename, **kwargs)``，不接受具名参数，
-    但会把 kwargs 透传给 ``cached_files``，后者有 ``token``，故同样适用。
+    ``cached_file`` itself accepts ``(path_or_repo_id, filename, **kwargs)`` and forwards
+    kwargs to ``cached_files``, which accepts ``token``.
 
-    为什么必须处理：``lazy/pretrained.py`` 把该参数显式传给
-    ``PretrainedConfig.from_pretrained(..., return_unused_kwargs=True)``。v4 里它被识别，
-    不进 unused；v5 里它成了「未识别参数」被原样退回 ``model_kwargs``，最终撞在模型
-    构造函数上（``TypeError: ... unexpected keyword argument 'use_auth_token'``）。
-    **用户什么都不传也会崩**（退回的是 ``None``），是必经路径而非边界情况。
+    This is required because ``lazy/pretrained.py`` passes the argument explicitly to
+    ``PretrainedConfig.from_pretrained(..., return_unused_kwargs=True)``. v4 recognizes it
+    and does not return it as unused; v5 would return it in ``model_kwargs`` as an unknown
+    argument and eventually raise ``TypeError: ... unexpected keyword argument
+    'use_auth_token'``. **Even omitting the argument triggers the failure**, because the
+    returned value is ``None``.
 
-    检测顺序：**先探 ``token``**。理由是两个名字都存在的过渡版本里，``token`` 是新名，
-    取它不会踩到 ``use_auth_token`` 的弃用告警。
+    Probe ``token`` first. In transitional versions that expose both names, this selects the
+    new name without triggering a deprecation warning for ``use_auth_token``.
 
     Returns:
-        str: ``"token"`` 或 ``"use_auth_token"``。取不到签名时兜底为新名 ``"token"``。
+        str: ``"token"`` or ``"use_auth_token"``. Falls back to ``"token"`` if signature
+            inspection fails.
     """
     global _AUTH_KWARG_NAME
     if _AUTH_KWARG_NAME is None:
@@ -160,19 +163,19 @@ def get_auth_kwarg_name() -> str:
 
 
 def auth_kwargs(token: Any = None) -> Dict[str, Any]:
-    r"""构造「认证参数」kwargs，名字随 transformers 版本自动切换。
+    r"""Build authentication kwargs with the name used by the installed transformers.
 
-    调用点写法（把原来的 ``use_auth_token=use_auth_token`` 换掉）::
+    Call sites replace ``use_auth_token=use_auth_token`` with::
 
         config, model_kwargs = cls.config_class.from_pretrained(
             config_path, ..., **auth_kwargs(use_auth_token)
         )
 
     Args:
-        token (Any): 认证 token。``None`` 表示不认证（也要显式传，见
-            :func:`get_auth_kwarg_name` 的说明）。
+        token (Any): Authentication token. ``None`` means unauthenticated, but is still
+            passed explicitly; see :func:`get_auth_kwarg_name`.
 
     Returns:
-        Dict[str, Any]: 形如 ``{"token": token}`` 或 ``{"use_auth_token": token}``。
+        Dict[str, Any]: Either ``{"token": token}`` or ``{"use_auth_token": token}``.
     """
     return {get_auth_kwarg_name(): token}
