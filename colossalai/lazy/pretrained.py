@@ -49,9 +49,9 @@ def new_from_pretrained(
         is_safetensors_available,
     )
 
-    # transformers v5 兼容层（详见 colossalai/_compat.py）：
-    #   no_init_weights  v5 搬到 transformers.initialization —— 取回后下方调用点写法不变
-    #   download_url     v5 已整体删除 —— 取回 None，由下方裸 URL 分支显式处理
+    # Transformers v5 compatibility helpers (see `colossalai/_compat.py`):
+    # `no_init_weights` moved to `transformers.initialization`; `download_url` was removed
+    # entirely and therefore returns `None`, which the raw-URL branch handles explicitly.
     no_init_weights = get_no_init_weights()
     download_url = get_download_url()
 
@@ -62,9 +62,9 @@ def new_from_pretrained(
     force_download = kwargs.pop("force_download", False)
     proxies = kwargs.pop("proxies", None)
     local_files_only = kwargs.pop("local_files_only", False)
-    # 认证参数：v4 名 `use_auth_token`，v5 改名 `token`（见 colossalai/_compat.py）。
-    # 两个名字都收，否则用户在 v5 下传 `token=` 会与本函数下方显式传的同名参数冲突
-    # （`got multiple values for keyword argument 'token'`）。
+    # v4 called this argument `use_auth_token`; v5 renamed it to `token` (see
+    # `colossalai/_compat.py`). Accept both names so an explicit v5 `token` does not
+    # collide with the keyword passed to the config loader below.
     use_auth_token = kwargs.pop("use_auth_token", None)
     if use_auth_token is None:
         use_auth_token = kwargs.pop("token", None)
@@ -182,14 +182,14 @@ def new_from_pretrained(
             is_local = True
         elif is_remote_url(pretrained_model_name_or_path):
             if download_url is None:
-                # transformers v5 移除了裸 URL 加载：download_url / is_remote_url 在 v5
-                # 安装树里 0 处残留，cached_file 也不再接受 URL。这里对齐 v5 的能力边界
-                # 并给出解释性报错；不静默落到 else 分支（那会拿 repo id 去缓存里找，
-                # 用户只看到一个看不出真实原因的 OSError）。
+                # Transformers v5 removed raw-URL loading: `download_url` and
+                # `is_remote_url` no longer exist in the installed tree, and `cached_file`
+                # no longer accepts URLs. Fail explicitly instead of treating the URL as a
+                # repository id and exposing an opaque cache lookup error.
                 raise NotImplementedError(
-                    "transformers v5 不再支持从裸 URL 加载权重，收到 "
-                    f"{pretrained_model_name_or_path!r}。请先把权重下载到本地目录后传入该目录，"
-                    "或改用 HuggingFace repo id。"
+                    "Transformers v5 no longer supports loading weights from a raw URL; received "
+                    f"{pretrained_model_name_or_path!r}. Download the weights to a local directory "
+                    "first, or use a Hugging Face repository ID."
                 )
             filename = pretrained_model_name_or_path
             resolved_archive_file = download_url(pretrained_model_name_or_path)
