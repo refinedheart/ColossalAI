@@ -13,7 +13,17 @@ from colossalai.pipeline.stage_manager import PipelineStageManager
 from colossalai.quantization.fp8 import cast_from_fp8_pipeline, cast_to_fp8_pipeline
 from colossalai.utils import get_current_device
 
-from ._utils import detach, get_batch_size, get_micro_batch, merge_batch, model_forward, retain_grad, to_device
+from ._utils import (
+    collect_gradients,
+    detach,
+    flatten_tensors_and_grads,
+    get_batch_size,
+    get_micro_batch,
+    merge_batch,
+    model_forward,
+    retain_grad,
+    to_device,
+)
 from .base import PipelineSchedule
 
 
@@ -354,8 +364,13 @@ class InterleavedSchedule(PipelineSchedule):
             tensors_to_backward = []
             grads_to_backward = []
             for k in keys:
-                tensors_to_backward.append(output_obj[k])
-                grads_to_backward.append(output_obj_grad[k])
+                if k not in output_obj_grad:
+                    continue
+                for tensor, grad in flatten_tensors_and_grads(output_obj[k], output_obj_grad[k]):
+                    tensors_to_backward.append(tensor)
+                    grads_to_backward.append(grad)
+            if not tensors_to_backward:
+                return None
             if len(tensors_to_backward) == 1:
                 optimizer.backward_by_grad(tensors_to_backward[0], grads_to_backward[0])
             else:
@@ -366,8 +381,9 @@ class InterleavedSchedule(PipelineSchedule):
         if input_obj is not None:
             input_obj_grad = {}
             for k, v in input_obj.items():
-                if isinstance(v, torch.Tensor) and v.grad is not None:
-                    input_obj_grad[k] = v.grad
+                gradients = collect_gradients(v)
+                if gradients is not None:
+                    input_obj_grad[k] = gradients
         return input_obj_grad
 
     def run_forward_only(

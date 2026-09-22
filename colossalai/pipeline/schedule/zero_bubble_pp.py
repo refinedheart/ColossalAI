@@ -15,6 +15,7 @@ from colossalai.pipeline.stage_manager import PipelineStageManager
 from colossalai.pipeline.weight_grad_store import WeightGradStore
 
 from ._utils import (
+    collect_gradients,
     clone,
     detach,
     get_batch_size,
@@ -584,8 +585,9 @@ class ZeroBubbleVPipeScheduler(PipelineSchedule):
             pass
         else:
             for k, v in input_obj.items():
-                if isinstance(v, torch.Tensor) and v.grad is not None:
-                    input_obj_grad[k] = v.grad
+                gradients = collect_gradients(v)
+                if gradients is not None:
+                    input_obj_grad[k] = gradients
         return input_obj_grad
 
     def backward_w_step(

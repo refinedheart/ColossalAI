@@ -1,6 +1,12 @@
 import torch
 
-from colossalai.pipeline.schedule._utils import get_batch_size, get_micro_batch, merge_batch
+from colossalai.pipeline.schedule._utils import (
+    collect_gradients,
+    flatten_tensors_and_grads,
+    get_batch_size,
+    get_micro_batch,
+    merge_batch,
+)
 
 
 def test_get_batch_size():
@@ -45,3 +51,20 @@ def test_merge_batch():
     merged = merge_batch([{"x": x[0:1], "y": y[0:1]}, {"x": x[1:2], "y": y[1:2]}])
     assert torch.equal(merged["x"], x)
     assert torch.equal(merged["y"], y)
+
+
+def test_collect_nested_gradients():
+    hidden_states = torch.rand(2, requires_grad=True)
+    router_logits = (torch.rand(2, requires_grad=True), torch.rand(2, requires_grad=True))
+    outputs = {"hidden_states": hidden_states, "past_router_logits": router_logits}
+
+    (hidden_states.sum() + sum(logits.sum() for logits in router_logits)).backward()
+
+    gradients = collect_gradients(outputs)
+    assert gradients is not None
+    pairs = flatten_tensors_and_grads(outputs, gradients)
+    assert len(pairs) == 3
+    for tensor, grad in pairs:
+        assert grad is tensor.grad
+
+    assert collect_gradients({"metadata": ("not a tensor",)}) is None
