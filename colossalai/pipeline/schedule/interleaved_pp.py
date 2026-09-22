@@ -60,12 +60,12 @@ class InterleavedSchedule(PipelineSchedule):
         self.last_batch_size: Optional[int] = None
         self.microbatch_offset: List[int]
 
-        # P2PMeta cache
+        # P2P metadata is chunk-local because virtual chunks may send different pytrees.
         self.enable_metadata_cache = enable_metadata_cache
-        self.send_tensor_metadata = True
-        self.send_grad_metadata = True
-        self.tensor_metadata_recv = None
-        self.grad_metadata_recv = None
+        self.send_tensor_metadata = [True] * num_model_chunks
+        self.send_grad_metadata = [True] * num_model_chunks
+        self.tensor_metadata_recv = [None] * num_model_chunks
+        self.grad_metadata_recv = [None] * num_model_chunks
 
         self.fp8_communication = fp8_communication
 
@@ -104,10 +104,10 @@ class InterleavedSchedule(PipelineSchedule):
             # NOTE: disable metadata cache when batch size changes (not valid anymore)
             if self.batch_size != self.last_batch_size:
                 self.enable_metadata_cache = False
-                self.send_tensor_metadata = True
-                self.send_grad_metadata = True
-                self.tensor_metadata_recv = None
-                self.grad_metadata_recv = None
+                self.send_tensor_metadata = [True] * self.num_model_chunks
+                self.send_grad_metadata = [True] * self.num_model_chunks
+                self.tensor_metadata_recv = [None] * self.num_model_chunks
+                self.grad_metadata_recv = [None] * self.num_model_chunks
 
         self.last_batch_size = self.batch_size
 
@@ -159,10 +159,12 @@ class InterleavedSchedule(PipelineSchedule):
         """
         with self.stage_manager.switch_model_chunk_id(model_chunk_id):
             if not self.stage_manager.is_first_stage():
-                input_tensor, wait_handles = self.comm.recv_forward(prev_rank, metadata_recv=self.tensor_metadata_recv)
+                input_tensor, wait_handles = self.comm.recv_forward(
+                    prev_rank, metadata_recv=self.tensor_metadata_recv[model_chunk_id]
+                )
 
-                if self.enable_metadata_cache and self.tensor_metadata_recv is None:
-                    self.tensor_metadata_recv = create_send_metadata(input_tensor)
+                if self.enable_metadata_cache and self.tensor_metadata_recv[model_chunk_id] is None:
+                    self.tensor_metadata_recv[model_chunk_id] = create_send_metadata(input_tensor)
 
                 return input_tensor, wait_handles
         return None, []
@@ -182,10 +184,10 @@ class InterleavedSchedule(PipelineSchedule):
         with self.stage_manager.switch_model_chunk_id(model_chunk_id):
             if not self.stage_manager.is_last_stage():
                 output_tensor_grad, wait_handles = self.comm.recv_backward(
-                    next_rank, metadata_recv=self.grad_metadata_recv
+                    next_rank, metadata_recv=self.grad_metadata_recv[model_chunk_id]
                 )
-                if self.enable_metadata_cache and self.grad_metadata_recv is None:
-                    self.grad_metadata_recv = create_send_metadata(output_tensor_grad)
+                if self.enable_metadata_cache and self.grad_metadata_recv[model_chunk_id] is None:
+                    self.grad_metadata_recv[model_chunk_id] = create_send_metadata(output_tensor_grad)
                 return output_tensor_grad, wait_handles
 
         return None, []
@@ -206,8 +208,10 @@ class InterleavedSchedule(PipelineSchedule):
             if not self.stage_manager.is_last_stage():
                 if self.fp8_communication:
                     cast_to_fp8_pipeline(output_tensor)
-                send_handles = self.comm.send_forward(output_tensor, next_rank, send_metadata=self.send_tensor_metadata)
-                self.send_tensor_metadata = not self.enable_metadata_cache
+                send_handles = self.comm.send_forward(
+                    output_tensor, next_rank, send_metadata=self.send_tensor_metadata[model_chunk_id]
+                )
+                self.send_tensor_metadata[model_chunk_id] = not self.enable_metadata_cache
                 if self.fp8_communication:
                     cast_from_fp8_pipeline(output_tensor)
                 return send_handles
@@ -230,9 +234,9 @@ class InterleavedSchedule(PipelineSchedule):
                 if self.fp8_communication:
                     cast_to_fp8_pipeline(input_tensor_grad)
                 send_handles = self.comm.send_backward(
-                    input_tensor_grad, prev_rank, send_metadata=self.send_grad_metadata
+                    input_tensor_grad, prev_rank, send_metadata=self.send_grad_metadata[model_chunk_id]
                 )
-                self.send_grad_metadata = not self.enable_metadata_cache
+                self.send_grad_metadata[model_chunk_id] = not self.enable_metadata_cache
                 if self.fp8_communication:
                     cast_from_fp8_pipeline(input_tensor_grad)
                 return send_handles
@@ -251,14 +255,14 @@ class InterleavedSchedule(PipelineSchedule):
             output_tensor,
             is_send,
             is_recv,
-            send_metadata=self.send_tensor_metadata,
-            metadata_recv=self.tensor_metadata_recv,
+            send_metadata=self.send_tensor_metadata[model_chunk_id_send],
+            metadata_recv=self.tensor_metadata_recv[model_chunk_id_recv],
             send_first=send_first,
         )
         # Cache metadata
-        self.send_tensor_metadata = not self.enable_metadata_cache and is_send
-        if is_recv and self.enable_metadata_cache and self.tensor_metadata_recv is None:
-            self.tensor_metadata_recv = create_send_metadata(input_tensor)
+        self.send_tensor_metadata[model_chunk_id_send] = not self.enable_metadata_cache and is_send
+        if is_recv and self.enable_metadata_cache and self.tensor_metadata_recv[model_chunk_id_recv] is None:
+            self.tensor_metadata_recv[model_chunk_id_recv] = create_send_metadata(input_tensor)
 
         if self.fp8_communication:
             cast_from_fp8_pipeline(output_tensor)
@@ -277,14 +281,14 @@ class InterleavedSchedule(PipelineSchedule):
             input_tensor_grad,
             is_send,
             is_recv,
-            send_metadata=self.send_grad_metadata,
-            metadata_recv=self.grad_metadata_recv,
+            send_metadata=self.send_grad_metadata[model_chunk_id_send],
+            metadata_recv=self.grad_metadata_recv[model_chunk_id_recv],
             send_first=send_first,
         )
         # Cache metadata
-        self.send_grad_metadata = not self.enable_metadata_cache and is_send
-        if is_recv and self.enable_metadata_cache and self.grad_metadata_recv is None:
-            self.grad_metadata_recv = create_send_metadata(output_tensor_grad)
+        self.send_grad_metadata[model_chunk_id_send] = not self.enable_metadata_cache and is_send
+        if is_recv and self.enable_metadata_cache and self.grad_metadata_recv[model_chunk_id_recv] is None:
+            self.grad_metadata_recv[model_chunk_id_recv] = create_send_metadata(output_tensor_grad)
         if self.fp8_communication:
             cast_from_fp8_pipeline(input_tensor_grad)
         return output_tensor_grad, wait_handles
