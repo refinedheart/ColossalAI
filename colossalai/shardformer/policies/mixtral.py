@@ -161,14 +161,14 @@ class MixtralPolicy(Policy):
                         },
                     ),
                     SubModuleReplacementDescription(
-                        # v5 把该子模块从 `block_sparse_moe` 改名为 `mlp`
+                        # v5 renamed this submodule from `block_sparse_moe` to `mlp`.
                         suffix="mlp.gate",
                         target_module=MixtralTopKRouter1D,
                         kwargs={
                             "gather_output": True,
-                            # SP 下序列按 rank 切分，专家的 TP gather 会把 rank r 的 token j 与
-                            # 另一个 rank 的 token j 对齐（实为不同 token）；router 权重极小，
-                            # 故 SP 时保持不切分、本地算全量 logits（见 modeling 的 early return）。
+                            # SP shards the sequence, so TP gathering would pair local token j from
+                            # different ranks. Keep the small router replicated and compute full logits
+                            # locally in SP mode (see the early return in modeling).
                             "seq_parallel_mode": sp_mode,
                             "fp8_communication": self.shard_config.fp8_communication,
                             "use_zbv": use_zbv,
@@ -217,8 +217,8 @@ class MixtralPolicy(Policy):
                         },
                     ),
                     SubModuleReplacementDescription(
-                        # v5 把该子模块从 `block_sparse_moe` 改名为 `mlp`；
-                        # 且 gate 的 forward 契约是**三元组**，故不能用 `LinearWithGradAccum`
+                        # v5 renamed this submodule from `block_sparse_moe` to `mlp`; the gate returns
+                        # a three-tuple, so `LinearWithGradAccum` cannot replace it directly.
                         suffix="mlp.gate",
                         target_module=MixtralTopKRouterWithGradAccum,
                         kwargs={
@@ -251,9 +251,9 @@ class MixtralPolicy(Policy):
             self.append_or_create_submodule_replacement(
                 description=[
                     SubModuleReplacementDescription(
-                        # v5 改名：`block_sparse_moe` → `mlp`；且 `mlp.experts` 已融合为 3D 参数
-                        # （`gate_up_proj` / `down_proj`）。`EPMixtralSparseMoeBlock` 的三原语重写
-                        # （docs/30 §四：布局切片 / 加载映射 / per-expert 调用）已落地，纯 EP 已验收。
+                        # v5 renamed `block_sparse_moe` to `mlp` and fused `mlp.experts` into 3D
+                        # `gate_up_proj` / `down_proj` parameters. The three EP primitives in
+                        # `EPMixtralSparseMoeBlock` are implemented and pure EP is validated.
                         suffix="mlp",
                         target_module=EPMixtralSparseMoeBlock,
                         kwargs={
