@@ -56,6 +56,31 @@ except ImportError:
     _EXTRA_STATE_KEY_SUFFIX = "_extra_state"
 
 
+def _route_padded_parameter_aliases(model: nn.Module, state_dict: Dict[str, torch.Tensor]) -> None:
+    """Route aliased padded parameters through modules that know how to load them."""
+    modules = dict(model.named_modules())
+    aliases = defaultdict(lambda: {"managed": [], "regular": []})
+    for name, param in model.named_parameters(remove_duplicate=False):
+        if not is_padded_tensor(param):
+            continue
+
+        module_name, _, _ = name.rpartition(".")
+        module = modules[module_name]
+        loader = type(module)._load_from_state_dict
+        bucket = "managed" if loader is not nn.Module._load_from_state_dict else "regular"
+        aliases[id(param)][bucket].append(name)
+
+    for names in aliases.values():
+        if not names["managed"] or not names["regular"]:
+            continue
+        for regular_name in names["regular"]:
+            if regular_name not in state_dict:
+                continue
+            for managed_name in names["managed"]:
+                state_dict.setdefault(managed_name, state_dict[regular_name])
+            state_dict.pop(regular_name)
+
+
 class HybridParallelCheckpointIO(GeneralCheckpointIO):
     """
     CheckpointIO for Hybrid Parallel Training.
@@ -851,6 +876,7 @@ class HybridParallelCheckpointIO(GeneralCheckpointIO):
         # has been implemented by _load_from_state_dict method of ParallelModule in Shardformer,
         # model.load_state_dict can be directly called.
         state_dict = load_state_dict(checkpoint)
+        _route_padded_parameter_aliases(model, state_dict)
         if not low_cpu_mem_mode:
             state_dict = create_pinned_state_dict(state_dict, empty=False, num_threads=num_threads)
         model.load_state_dict(state_dict, strict=strict)
