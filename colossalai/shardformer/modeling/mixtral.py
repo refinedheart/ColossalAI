@@ -34,9 +34,11 @@ from colossalai.quantization.fp8 import all_reduce_fp8
 from colossalai.shardformer.layer._operation import (
     all_to_all_comm,
     gather_forward_split_backward,
+    linear_with_async_comm,
+    reduce_forward,
     split_forward_gather_backward,
 )
-from colossalai.shardformer.layer.linear import Linear1D_Col, Linear1D_Row, LinearWithGradAccum, ParallelModule
+from colossalai.shardformer.layer.linear import Linear1D_Col, LinearWithGradAccum, ParallelModule
 from colossalai.shardformer.shard import ShardConfig
 from colossalai.tensor.moe_tensor.api import set_moe_tensor_ep_group
 
@@ -54,7 +56,12 @@ if is_flash_attn_2_available():
 
 
 def _register_fused_expert_checkpoint_hook(
-    experts: torch.nn.Module, expert_start_idx: int, num_experts_per_ep: int, num_experts: int
+    experts: torch.nn.Module,
+    expert_start_idx: int,
+    num_experts_per_ep: int,
+    num_experts: int,
+    tp_rank: int = 0,
+    tp_size: int = 1,
 ) -> None:
     """Shard full fused-expert parameters before they reach the local EP module."""
 
@@ -75,14 +82,34 @@ def _register_fused_expert_checkpoint_hook(
             local_param = getattr(module, name)
             if checkpoint_param is None or checkpoint_param.shape == local_param.shape:
                 continue
-            if (
-                checkpoint_param.ndim == local_param.ndim
-                and checkpoint_param.shape[0] == num_experts
-                and checkpoint_param.shape[1:] == local_param.shape[1:]
-            ):
-                state_dict[key] = checkpoint_param[
-                    expert_start_idx : expert_start_idx + num_experts_per_ep
-                ].contiguous()
+            if checkpoint_param.ndim != local_param.ndim or checkpoint_param.shape[0] != num_experts:
+                continue
+
+            checkpoint_param = checkpoint_param[expert_start_idx : expert_start_idx + num_experts_per_ep]
+            if tp_size > 1:
+                if name == "gate_up_proj":
+                    if checkpoint_param.shape[1] % 2 != 0:
+                        continue
+                    intermediate_size = checkpoint_param.shape[1] // 2
+                    if intermediate_size % tp_size != 0:
+                        continue
+                    tp_partition_size = intermediate_size // tp_size
+                    tp_start = tp_rank * tp_partition_size
+                    checkpoint_param = torch.cat(
+                        (
+                            checkpoint_param.narrow(1, tp_start, tp_partition_size),
+                            checkpoint_param.narrow(1, intermediate_size + tp_start, tp_partition_size),
+                        ),
+                        dim=1,
+                    )
+                else:
+                    if checkpoint_param.shape[2] % tp_size != 0:
+                        continue
+                    tp_partition_size = checkpoint_param.shape[2] // tp_size
+                    checkpoint_param = checkpoint_param.narrow(2, tp_rank * tp_partition_size, tp_partition_size)
+
+            if checkpoint_param.shape == local_param.shape:
+                state_dict[key] = checkpoint_param.contiguous()
 
     experts.register_load_state_dict_pre_hook(_slice_full_expert_params)
 
@@ -256,7 +283,6 @@ class EPMixtralSparseMoeBlock(ParallelModule):
         experts.gate_up_proj = torch.nn.Parameter(experts.gate_up_proj[s : s + n].clone())
         experts.down_proj = torch.nn.Parameter(experts.down_proj[s : s + n].clone())
         experts.num_experts = n
-        _register_fused_expert_checkpoint_hook(experts, s, n, num_experts)
 
         # setup moe_dp group
         self.moe_dp_group = moe_dp_group
@@ -264,12 +290,39 @@ class EPMixtralSparseMoeBlock(ParallelModule):
 
         # setup global tp group
         self.tp_group = tp_group
-        if self.tp_group.size() > 1:
-            # TP-over-experts over the fused 3D params is a follow-up (docs/30 §六); not implemented yet.
-            raise NotImplementedError(
-                "Tensor parallelism over the fused v5 experts is not yet implemented (docs/30 §六); "
-                "use pure expert parallelism (tp_size=1) for now."
+        self.tp_size = tp_group.size()
+        self.tp_rank = dist.get_rank(tp_group)
+        if self.tp_size > 1:
+            gate_up_proj = experts.gate_up_proj
+            down_proj = experts.down_proj
+            if gate_up_proj.shape[1] % 2 != 0:
+                raise ValueError("The fused gate_up_proj dimension must contain an even gate/up pair.")
+            intermediate_size = gate_up_proj.shape[1] // 2
+            if intermediate_size != down_proj.shape[2]:
+                raise ValueError("The fused gate_up_proj and down_proj intermediate dimensions must match.")
+            if intermediate_size % self.tp_size != 0:
+                raise ValueError("The fused intermediate dimension must be divisible by tp_size.")
+            if down_proj.shape[2] % self.tp_size != 0:
+                raise ValueError("The fused down_proj intermediate dimension must be divisible by tp_size.")
+
+            gate_up_partition_size = intermediate_size // self.tp_size
+            down_partition_size = down_proj.shape[2] // self.tp_size
+            tp_start = self.tp_rank * gate_up_partition_size
+            experts.gate_up_proj = torch.nn.Parameter(
+                torch.cat(
+                    (
+                        gate_up_proj[:, tp_start : tp_start + gate_up_partition_size],
+                        gate_up_proj[
+                            :, intermediate_size + tp_start : intermediate_size + tp_start + gate_up_partition_size
+                        ],
+                    ),
+                    dim=1,
+                ).clone()
             )
+            tp_start = self.tp_rank * down_partition_size
+            experts.down_proj = torch.nn.Parameter(down_proj[:, :, tp_start : tp_start + down_partition_size].clone())
+
+        _register_fused_expert_checkpoint_hook(experts, s, n, num_experts, tp_rank=self.tp_rank, tp_size=self.tp_size)
 
         # primitive ② (docs/30 §4.2): mark the sliced fused params so the sharded loader slices dim 0
         # (the expert dimension) by `ep_group`.
@@ -289,7 +342,8 @@ class EPMixtralSparseMoeBlock(ParallelModule):
         LazyInitContext.materialize(module)
         module.__class__ = EPMixtralSparseMoeBlock
         fp8_communication = kwargs.get("fp8_communication", False)
-        module.setup_process_groups(tp_group, moe_dp_group, ep_group, fp8_communication)
+        use_zbv = kwargs.get("use_zbv", False)
+        module.setup_process_groups(tp_group, moe_dp_group, ep_group, fp8_communication, use_zbv)
         return module
 
     def _expert_forward(self, x: torch.Tensor, expert_idx: int) -> torch.Tensor:
@@ -297,10 +351,28 @@ class EPMixtralSparseMoeBlock(ParallelModule):
 
         Mirrors v5's ``MixtralExperts.forward``: ``gate, up = linear(x, gate_up_proj[e]).chunk(2,
         dim=-1)``, ``act_fn(gate) * up``, then ``linear(down_proj[e])``. The fused params are already
-        sliced to ``[E/ep, ...]``, so ``expert_idx`` is a local index.
+        sliced to ``[E/ep, ...]``, so ``expert_idx`` is a local index. With TP over experts, each local
+        ``gate_up_proj`` keeps matching gate/up slices and ``down_proj`` keeps the corresponding input slice;
+        the partial output is then reduced.
         """
-        gate, up = F.linear(x, self.experts.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-        return F.linear(self.experts.act_fn(gate) * up, self.experts.down_proj[expert_idx])
+        gate_up_weight = self.experts.gate_up_proj[expert_idx]
+        if self.tp_size == 1:
+            gate_up = F.linear(x, gate_up_weight)
+        else:
+            gate_up = linear_with_async_comm(
+                x,
+                gate_up_weight,
+                None,
+                self.tp_group,
+                async_grad_allreduce=True,
+                fp8_communication=self.fp8_communication,
+                use_zbv=self.use_zbv,
+            )
+        gate, up = gate_up.chunk(2, dim=-1)
+        output = F.linear(self.experts.act_fn(gate) * up, self.experts.down_proj[expert_idx])
+        if self.tp_size > 1:
+            output = reduce_forward(output, self.tp_group, fp8_communication=self.fp8_communication)
+        return output
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
