@@ -87,6 +87,19 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
                 continue
             # Gather tensor pieces when using tensor parallel.
             param_ = gather_distributed_param(param, keep_vars=False)
+            # A sharded checkpoint has one weight-map entry per parameter name. Gather
+            # EP-local expert slices to the EP root so every rank can reload the same
+            # full expert tensor and let the model's load hook select its local slice.
+            if is_moe_tensor(param):
+                ep_group = param.ep_group
+                ep_size = dist.get_world_size(ep_group)
+                if ep_size > 1:
+                    ep_rank = dist.get_rank(ep_group)
+                    ep_root = get_global_rank(ep_group, 0)
+                    gathered = [torch.empty_like(param_) for _ in range(ep_size)] if ep_rank == 0 else None
+                    dist.gather(param_.contiguous(), gather_list=gathered, dst=ep_root, group=ep_group)
+                    if ep_rank == 0:
+                        param_ = torch.cat(gathered, dim=0)
             block, block_size = state_dict_sharder.append_param(prefix + name, param_)
             if block is not None:
                 yield block, block_size
@@ -154,15 +167,15 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
             dist.barrier()
             return
 
-        # ep_rank 0 saves all the parameters and buffers.
-        # other ep_ranks save only experts
+        # Experts are gathered across EP by `_model_sharder`; only the EP/TP/SP
+        # root for this pipeline stage writes checkpoint shards/index entries.
 
         # Then collect the sharded parameters & buffers along tp_group.
-        # Only devices with tp_rank == 0 are responsible for model saving.
+        # Only devices with ep_rank == tp_rank == sp_rank == 0 write model shards.
         state_dict_shard = MoECheckpointIO._model_sharder(model, size_per_shard=size_per_shard)
         weights_name, save_index_file = get_model_base_filenames(prefix, use_safetensors)
         index_file = CheckpointIndexFile(checkpoint)
-        control_saving = self.tp_rank == 0 and self.sp_rank == 0
+        control_saving = self.ep_rank == 0 and self.tp_rank == 0 and self.sp_rank == 0
 
         if self.pp_size == 1 and self.ep_size == 1:
             # When pipeline is not used, save the model shards as in general checkpointIO
@@ -190,9 +203,8 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
 
             dist.barrier()
         else:
-            # When pipeline is used, each stage produces its own shard files and index files.
-            # Index files belonging to each stage are saved under a temporary folder ./tmp_index_files/
-            # After all the state_dicts have been saved, the master rank integrates all the index files into one final index file and deletes the tmp folder.
+            # With PP or EP, the EP/TP/SP root for each pipeline stage writes shard files and a
+            # stage-local index under ./tmp_index_files/. The master later integrates those indexes.
 
             final_index_file_path = copy.deepcopy(save_index_file)
             tmp_index_file_folder = os.path.join(checkpoint, "tmp_index_files")

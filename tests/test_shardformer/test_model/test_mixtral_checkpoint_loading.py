@@ -67,6 +67,7 @@ def _check_tp_expert_checkpoint_gather(rank: int, world_size: int, port: int):
         timeout=timedelta(seconds=30),
     )
     try:
+        ep_groups = [dist.new_group(ranks=[0]), dist.new_group(ranks=[1])]
         full_gate_up = torch.arange(8 * 8 * 4, dtype=torch.float32).reshape(8, 8, 4)
         full_down = torch.arange(8 * 4 * 6, dtype=torch.float32).reshape(8, 4, 6)
         local_gate_up = torch.cat(
@@ -79,8 +80,8 @@ def _check_tp_expert_checkpoint_gather(rank: int, world_size: int, port: int):
         experts.down_proj = nn.Parameter(local_down.clone())
         _mark_fused_expert_tp_shard(experts.gate_up_proj, "gate_up_proj", dist.group.WORLD, 2, 2, 8)
         _mark_fused_expert_tp_shard(experts.down_proj, "down_proj", dist.group.WORLD, 2, 2, 8)
-        set_moe_tensor_ep_group(experts.gate_up_proj, dist.group.WORLD)
-        set_moe_tensor_ep_group(experts.down_proj, dist.group.WORLD)
+        set_moe_tensor_ep_group(experts.gate_up_proj, ep_groups[rank])
+        set_moe_tensor_ep_group(experts.down_proj, ep_groups[rank])
         assert is_moe_tensor(experts.gate_up_proj) and is_moe_tensor(experts.down_proj)
 
         saved_state = {}
@@ -151,8 +152,20 @@ def _check_tp_ep_expert_checkpoint_gather(rank: int, world_size: int, port: int)
         saved_state = {}
         for shard, _ in MoECheckpointIO._model_sharder(experts):
             saved_state.update(shard)
-        assert torch.equal(saved_state["gate_up_proj"], ep_gate_up)
-        assert torch.equal(saved_state["down_proj"], ep_down)
+        if ep_rank == 0:
+            assert torch.equal(saved_state["gate_up_proj"], full_gate_up)
+            assert torch.equal(saved_state["down_proj"], full_down)
+        else:
+            assert torch.equal(saved_state["gate_up_proj"], ep_gate_up)
+            assert torch.equal(saved_state["down_proj"], ep_down)
+
+        # The shared index points to the EP-root file, whose expert tensors are full.
+        checkpoint_state = {
+            "gate_up_proj": saved_state["gate_up_proj"] if rank == 0 else torch.empty_like(full_gate_up),
+            "down_proj": saved_state["down_proj"] if rank == 0 else torch.empty_like(full_down),
+        }
+        dist.broadcast(checkpoint_state["gate_up_proj"], src=0)
+        dist.broadcast(checkpoint_state["down_proj"], src=0)
 
         reloaded = _FusedExperts(num_experts=4, gate_up_width=4, down_input_width=3)
         _register_fused_expert_checkpoint_hook(
@@ -163,7 +176,7 @@ def _check_tp_ep_expert_checkpoint_gather(rank: int, world_size: int, port: int)
             tp_rank=tp_rank,
             tp_size=2,
         )
-        reloaded.load_state_dict(saved_state)
+        reloaded.load_state_dict(checkpoint_state)
         assert torch.equal(reloaded.gate_up_proj, local_gate_up)
         assert torch.equal(reloaded.down_proj, local_down)
     finally:
