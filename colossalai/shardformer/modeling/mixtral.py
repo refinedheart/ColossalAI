@@ -53,6 +53,40 @@ if is_flash_attn_2_available():
     _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
 
 
+def _register_fused_expert_checkpoint_hook(
+    experts: torch.nn.Module, expert_start_idx: int, num_experts_per_ep: int, num_experts: int
+) -> None:
+    """Shard full fused-expert parameters before they reach the local EP module."""
+
+    def _slice_full_expert_params(
+        module: torch.nn.Module,
+        state_dict,
+        prefix: str,
+        local_metadata,
+        strict: bool,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        del local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        for name in ("gate_up_proj", "down_proj"):
+            key = prefix + name
+            checkpoint_param = state_dict.get(key)
+            local_param = getattr(module, name)
+            if checkpoint_param is None or checkpoint_param.shape == local_param.shape:
+                continue
+            if (
+                checkpoint_param.ndim == local_param.ndim
+                and checkpoint_param.shape[0] == num_experts
+                and checkpoint_param.shape[1:] == local_param.shape[1:]
+            ):
+                state_dict[key] = checkpoint_param[
+                    expert_start_idx : expert_start_idx + num_experts_per_ep
+                ].contiguous()
+
+    experts.register_load_state_dict_pre_hook(_slice_full_expert_params)
+
+
 class _MixtralTopKRouterMixin:
     r"""Sharded / grad-accumulation variants of the v5 ``MixtralTopKRouter``.
 
@@ -222,6 +256,7 @@ class EPMixtralSparseMoeBlock(ParallelModule):
         experts.gate_up_proj = torch.nn.Parameter(experts.gate_up_proj[s : s + n].clone())
         experts.down_proj = torch.nn.Parameter(experts.down_proj[s : s + n].clone())
         experts.num_experts = n
+        _register_fused_expert_checkpoint_hook(experts, s, n, num_experts)
 
         # setup moe_dp group
         self.moe_dp_group = moe_dp_group
