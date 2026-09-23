@@ -40,6 +40,7 @@ from colossalai.shardformer.layer._operation import (
 )
 from colossalai.shardformer.layer.linear import Linear1D_Col, LinearWithGradAccum, ParallelModule
 from colossalai.shardformer.shard import ShardConfig
+from colossalai.tensor.d_tensor import init_tensor_as_customization_distributed
 from colossalai.tensor.moe_tensor.api import set_moe_tensor_ep_group
 
 # v4-era flag, read by `get_mixtral_flash_attention_forward` for a one-off warning. It is only
@@ -53,6 +54,54 @@ if is_flash_attn_2_available():
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
     _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
+
+
+def _slice_fused_expert_param(
+    tensor: torch.Tensor,
+    name: str,
+    expert_start_idx: int,
+    num_experts_per_ep: int,
+    num_experts: int,
+    tp_rank: int,
+    tp_size: int,
+    local_shape: torch.Size,
+) -> torch.Tensor:
+    """Select this rank's EP experts and TP columns from a full or EP-local checkpoint tensor."""
+    if tensor.shape == local_shape:
+        return tensor
+    if tensor.ndim != len(local_shape):
+        raise ValueError(f"Unexpected {name} rank in the Mixtral expert checkpoint.")
+
+    if tensor.shape[0] == num_experts:
+        tensor = tensor[expert_start_idx : expert_start_idx + num_experts_per_ep]
+    elif tensor.shape[0] != num_experts_per_ep:
+        raise ValueError(f"Unexpected expert dimension in the Mixtral {name} checkpoint.")
+
+    if tp_size > 1:
+        if name == "gate_up_proj":
+            if tensor.shape[1] % 2 != 0:
+                raise ValueError("The fused gate_up_proj dimension must contain an even gate/up pair.")
+            intermediate_size = tensor.shape[1] // 2
+            if intermediate_size % tp_size != 0:
+                raise ValueError("The fused gate_up_proj dimension must be divisible by tp_size.")
+            tp_partition_size = intermediate_size // tp_size
+            tp_start = tp_rank * tp_partition_size
+            tensor = torch.cat(
+                (
+                    tensor.narrow(1, tp_start, tp_partition_size),
+                    tensor.narrow(1, intermediate_size + tp_start, tp_partition_size),
+                ),
+                dim=1,
+            )
+        else:
+            if tensor.shape[2] % tp_size != 0:
+                raise ValueError("The fused down_proj intermediate dimension must be divisible by tp_size.")
+            tp_partition_size = tensor.shape[2] // tp_size
+            tensor = tensor.narrow(2, tp_rank * tp_partition_size, tp_partition_size)
+
+    if tensor.shape != local_shape:
+        raise ValueError(f"The sliced Mixtral {name} shape does not match the local expert parameter.")
+    return tensor.contiguous()
 
 
 def _register_fused_expert_checkpoint_hook(
@@ -80,38 +129,63 @@ def _register_fused_expert_checkpoint_hook(
             key = prefix + name
             checkpoint_param = state_dict.get(key)
             local_param = getattr(module, name)
-            if checkpoint_param is None or checkpoint_param.shape == local_param.shape:
+            if checkpoint_param is None:
                 continue
-            if checkpoint_param.ndim != local_param.ndim or checkpoint_param.shape[0] != num_experts:
-                continue
-
-            checkpoint_param = checkpoint_param[expert_start_idx : expert_start_idx + num_experts_per_ep]
-            if tp_size > 1:
-                if name == "gate_up_proj":
-                    if checkpoint_param.shape[1] % 2 != 0:
-                        continue
-                    intermediate_size = checkpoint_param.shape[1] // 2
-                    if intermediate_size % tp_size != 0:
-                        continue
-                    tp_partition_size = intermediate_size // tp_size
-                    tp_start = tp_rank * tp_partition_size
-                    checkpoint_param = torch.cat(
-                        (
-                            checkpoint_param.narrow(1, tp_start, tp_partition_size),
-                            checkpoint_param.narrow(1, intermediate_size + tp_start, tp_partition_size),
-                        ),
-                        dim=1,
-                    )
-                else:
-                    if checkpoint_param.shape[2] % tp_size != 0:
-                        continue
-                    tp_partition_size = checkpoint_param.shape[2] // tp_size
-                    checkpoint_param = checkpoint_param.narrow(2, tp_rank * tp_partition_size, tp_partition_size)
-
             if checkpoint_param.shape == local_param.shape:
-                state_dict[key] = checkpoint_param.contiguous()
+                continue
+            try:
+                state_dict[key] = _slice_fused_expert_param(
+                    checkpoint_param,
+                    name,
+                    expert_start_idx,
+                    num_experts_per_ep,
+                    num_experts,
+                    tp_rank,
+                    tp_size,
+                    local_param.shape,
+                )
+            except ValueError:
+                continue
 
     experts.register_load_state_dict_pre_hook(_slice_full_expert_params)
+
+
+def _mark_fused_expert_tp_shard(
+    param: torch.nn.Parameter,
+    name: str,
+    tp_group: ProcessGroup,
+    expert_start_idx: int,
+    num_experts_per_ep: int,
+    num_experts: int,
+) -> None:
+    """Attach checkpoint gather/scatter functions to a manually TP-sharded fused expert parameter."""
+    tp_rank = dist.get_rank(tp_group)
+    tp_size = dist.get_world_size(tp_group)
+    local_shape = param.shape
+
+    def shard_fn(tensor: torch.Tensor) -> torch.Tensor:
+        return _slice_fused_expert_param(
+            tensor,
+            name,
+            expert_start_idx,
+            num_experts_per_ep,
+            num_experts,
+            tp_rank,
+            tp_size,
+            local_shape,
+        )
+
+    def gather_fn(tensor: torch.Tensor) -> torch.Tensor:
+        gathered = [torch.empty_like(tensor) for _ in range(tp_size)]
+        dist.all_gather(gathered, tensor.contiguous(), group=tp_group)
+        if name == "gate_up_proj":
+            partition_size = tensor.shape[1] // 2
+            gate = torch.cat([shard[:, :partition_size] for shard in gathered], dim=1)
+            up = torch.cat([shard[:, partition_size:] for shard in gathered], dim=1)
+            return torch.cat((gate, up), dim=1)
+        return torch.cat(gathered, dim=2)
+
+    init_tensor_as_customization_distributed(param, shard_fn, gather_fn)
 
 
 class _MixtralTopKRouterMixin:
@@ -321,6 +395,10 @@ class EPMixtralSparseMoeBlock(ParallelModule):
             )
             tp_start = self.tp_rank * down_partition_size
             experts.down_proj = torch.nn.Parameter(down_proj[:, :, tp_start : tp_start + down_partition_size].clone())
+
+            # These manual slices are plain Parameters; checkpoint sharding needs explicit TP gather metadata.
+            _mark_fused_expert_tp_shard(experts.gate_up_proj, "gate_up_proj", tp_group, s, n, num_experts)
+            _mark_fused_expert_tp_shard(experts.down_proj, "down_proj", tp_group, s, n, num_experts)
 
         _register_fused_expert_checkpoint_hook(experts, s, n, num_experts, tp_rank=self.tp_rank, tp_size=self.tp_size)
 
