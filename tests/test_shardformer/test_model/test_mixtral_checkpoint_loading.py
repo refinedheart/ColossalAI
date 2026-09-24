@@ -5,7 +5,9 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from colossalai.checkpoint_io.index_file import CheckpointIndexFile
 from colossalai.checkpoint_io.moe_checkpoint import MoECheckpointIO
+from colossalai.interface.model import ModelWrapper
 from colossalai.shardformer.modeling.mixtral import _mark_fused_expert_tp_shard, _register_fused_expert_checkpoint_hook
 from colossalai.tensor.moe_tensor.api import is_moe_tensor, set_moe_tensor_ep_group
 from colossalai.testing.utils import spawn
@@ -185,3 +187,55 @@ def _check_tp_ep_expert_checkpoint_gather(rank: int, world_size: int, port: int)
 
 def test_gather_and_load_tp_ep_sharded_fused_expert_checkpoint():
     spawn(_check_tp_ep_expert_checkpoint_gather, nprocs=4)
+
+
+def test_async_sharded_checkpoint_uses_moe_shards(monkeypatch, tmp_path):
+    from colossalai.checkpoint_io import moe_checkpoint as moe_checkpoint_module
+    from colossalai.checkpoint_io.utils import get_model_base_filenames
+
+    model = ModelWrapper(nn.Linear(2, 2))
+    checkpoint_io = object.__new__(MoECheckpointIO)
+    checkpoint_io.moe_dp_rank = 0
+    checkpoint_io.ep_rank = 0
+    checkpoint_io.tp_rank = 0
+    checkpoint_io.sp_rank = 0
+    checkpoint_io.ep_size = 1
+    checkpoint_io.pp_size = 1
+    checkpoint_io.verbose = False
+    checkpoint_io.async_writers = []
+    checkpoint_io.pinned_state_dicts = {}
+
+    class FakeAsyncWriter:
+        def sync_before_step(self):
+            pass
+
+        def synchronize(self):
+            pass
+
+    writer = FakeAsyncWriter()
+    observed = {}
+
+    def fake_async_save_state_dict_shards(sharded_state_dict, checkpoint, index_file, base_filename, is_master):
+        shards = list(sharded_state_dict)
+        observed.update(checkpoint=checkpoint, base_filename=base_filename, is_master=is_master, shards=shards)
+        for idx, (shard, _) in enumerate(shards):
+            for name in shard:
+                index_file.append_weight_map(name, f"shard-{idx}.safetensors")
+        return sum(size for _, size in shards), [writer]
+
+    monkeypatch.setattr(moe_checkpoint_module, "async_save_state_dict_shards", fake_async_save_state_dict_shards)
+    monkeypatch.setattr(moe_checkpoint_module.dist, "barrier", lambda: None)
+    monkeypatch.setattr(moe_checkpoint_module, "save_config_file", lambda *args, **kwargs: None)
+
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint_io.save_sharded_model(model, str(checkpoint), use_safetensors=True, use_async=True)
+
+    _, index_filename = get_model_base_filenames(use_safetensors=True)
+    assert observed["checkpoint"] == str(checkpoint)
+    assert observed["base_filename"].endswith(".safetensors")
+    assert observed["is_master"] is True
+    assert len(observed["shards"]) == 1
+    assert checkpoint_io.async_writers == [writer]
+    index_file = checkpoint / index_filename
+    assert index_file.is_file()
+    assert set(CheckpointIndexFile.from_file(index_file).weight_map) == {"weight", "bias"}
