@@ -17,6 +17,7 @@ from colossalai.checkpoint_io.hybrid_parallel_checkpoint_io import HybridParalle
 from colossalai.checkpoint_io.index_file import CheckpointIndexFile
 from colossalai.checkpoint_io.utils import (
     StateDictSharder,
+    async_save_state_dict_shards,
     gather_distributed_param,
     gather_state_dict_fast,
     get_lora_state_dict,
@@ -74,10 +75,20 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
         keep_vars: bool = False,
         size_per_shard: int = 1024,
         param_name_pattern: Optional[str] = None,
+        pinned_state_dicts: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Iterator[Tuple[OrderedDict, int]]:
         # An internel method that breaks state_dict of model into shards within limited size.
 
         state_dict_sharder = StateDictSharder(size_per_shard)
+
+        def maybe_pin_tensor(name: str, tensor: torch.Tensor) -> torch.Tensor:
+            if pinned_state_dicts is None or not torch.is_tensor(tensor) or tensor.device.type != "cuda":
+                return tensor
+            full_name = prefix + name
+            if full_name not in pinned_state_dicts:
+                pinned_state_dicts[full_name] = torch.empty_like(tensor, device="cpu", pin_memory=True)
+            pinned_state_dicts[full_name].copy_(tensor)
+            return pinned_state_dicts[full_name]
 
         # Save parameters.
         for name, param in model.named_parameters():
@@ -100,6 +111,7 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
                     dist.gather(param_.contiguous(), gather_list=gathered, dst=ep_root, group=ep_group)
                     if ep_rank == 0:
                         param_ = torch.cat(gathered, dim=0)
+            param_ = maybe_pin_tensor(name, param_)
             block, block_size = state_dict_sharder.append_param(prefix + name, param_)
             if block is not None:
                 yield block, block_size
@@ -108,6 +120,7 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
         for name, buf in model.named_buffers():
             if buf is not None and name not in model._non_persistent_buffers_set:
                 buffer = buf if keep_vars else buf.detach()
+                buffer = maybe_pin_tensor(name, buffer)
                 block, block_size = state_dict_sharder.append_param(prefix + name, buffer)
                 if block is not None:
                     yield block, block_size
@@ -119,6 +132,7 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
             is not torch.nn.Module.get_extra_state
         ):
             extra_state = model.get_extra_state()
+            extra_state = maybe_pin_tensor(_EXTRA_STATE_KEY_SUFFIX, extra_state)
             block, block_size = state_dict_sharder.append_param(extra_state_key, extra_state)
             if block is not None:
                 yield block, block_size
@@ -172,15 +186,27 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
 
         # Then collect the sharded parameters & buffers along tp_group.
         # Only devices with ep_rank == tp_rank == sp_rank == 0 write model shards.
-        state_dict_shard = MoECheckpointIO._model_sharder(model, size_per_shard=size_per_shard)
         weights_name, save_index_file = get_model_base_filenames(prefix, use_safetensors)
         index_file = CheckpointIndexFile(checkpoint)
         control_saving = self.ep_rank == 0 and self.tp_rank == 0 and self.sp_rank == 0
+        pinned_state_dicts = None
+        if self.pp_size == 1 and self.ep_size == 1 and use_async and control_saving:
+            pinned_state_dicts = self.pinned_state_dicts.setdefault(hash(model), {})
+        state_dict_shard = MoECheckpointIO._model_sharder(
+            model, size_per_shard=size_per_shard, pinned_state_dicts=pinned_state_dicts
+        )
 
         if self.pp_size == 1 and self.ep_size == 1:
             # When pipeline is not used, save the model shards as in general checkpointIO
             if use_async:
-                super().save_unsharded_model(model, checkpoint, gather_dtensor, use_safetensors, use_async=use_async)
+                total_size, writers = async_save_state_dict_shards(
+                    sharded_state_dict=state_dict_shard,
+                    checkpoint=checkpoint,
+                    index_file=index_file,
+                    base_filename=weights_name,
+                    is_master=control_saving,
+                )
+                self.async_writers.extend(writers)
             else:
                 total_size = save_state_dict_shards(
                     sharded_state_dict=state_dict_shard,
@@ -190,16 +216,16 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
                     is_master=control_saving,
                     use_safetensors=use_safetensors,
                 )
-                if control_saving:
-                    index_file.append_meta_data("total_size", total_size)
-                    index_file.write_index_file(save_index_file)
-                    save_config_file(model, checkpoint)
-                    if self.verbose and self.coordinator.is_master():
-                        logging.info(
-                            f"The model is split into checkpoint shards. "
-                            f"You can find where each parameters has been saved in the "
-                            f"index located at {save_index_file}."
-                        )
+            if control_saving:
+                index_file.append_meta_data("total_size", total_size)
+                index_file.write_index_file(save_index_file)
+                save_config_file(model, checkpoint)
+                if self.verbose and self.coordinator.is_master():
+                    logging.info(
+                        f"The model is split into checkpoint shards. "
+                        f"You can find where each parameters has been saved in the "
+                        f"index located at {save_index_file}."
+                    )
 
             dist.barrier()
         else:
