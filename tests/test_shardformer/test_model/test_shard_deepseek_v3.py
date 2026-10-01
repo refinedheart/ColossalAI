@@ -7,6 +7,7 @@ import torch.distributed as dist
 from torch.testing import assert_close
 
 import colossalai
+from colossalai._compat import is_transformers_v5
 from colossalai.booster.plugin import MoeHybridParallelPlugin
 from colossalai.booster.plugin.moe_hybrid_parallel_plugin import MoeHybridParallelPlugin
 from colossalai.testing import parameterize, rerun_if_address_is_in_use, spawn
@@ -111,6 +112,9 @@ def check_deepseek_v3(rank, world_size, port, implementation):
 
 
 @pytest.mark.dist
+@pytest.mark.skipif(
+    not is_transformers_v5(), reason="the v4 policy targets the remote-code model; native DeepSeek-v3 needs v5"
+)
 @pytest.mark.parametrize("world_size", [4])
 @rerun_if_address_is_in_use()
 def test_deepseek_v3(world_size):

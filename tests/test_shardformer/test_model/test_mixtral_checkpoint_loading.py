@@ -1,16 +1,25 @@
 from collections import OrderedDict
 from datetime import timedelta
 
+import pytest
 import torch
 import torch.distributed as dist
 from torch import nn
 
+from colossalai._compat import is_transformers_v5
 from colossalai.checkpoint_io.index_file import CheckpointIndexFile
 from colossalai.checkpoint_io.moe_checkpoint import MoECheckpointIO
 from colossalai.interface.model import ModelWrapper
-from colossalai.shardformer.modeling.mixtral import _mark_fused_expert_tp_shard, _register_fused_expert_checkpoint_hook
 from colossalai.tensor.moe_tensor.api import is_moe_tensor, set_moe_tensor_ep_group
 from colossalai.testing.utils import spawn
+
+if not is_transformers_v5():
+    pytest.skip("fused Mixtral experts only exist in transformers v5", allow_module_level=True)
+
+from colossalai.shardformer.modeling.mixtral import (  # noqa: E402
+    _mark_fused_expert_tp_shard,
+    _register_fused_expert_checkpoint_hook,
+)
 
 
 class _FusedExperts(nn.Module):
