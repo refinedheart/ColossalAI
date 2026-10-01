@@ -33,6 +33,42 @@ from ..layer import ColoAttention, RingAttention, dist_cross_entropy
 _SUPPORTED_SP_MODE = ["all_to_all", "split_gather", "ring", "ring_attn"]
 
 
+def _get_causal_mask_input_embeddings(hidden_states, query_length: int, sequence_is_sharded: bool):
+    """Return a shape-only full-sequence view when PP receives an SP shard.
+
+    Transformers' ``create_causal_mask`` infers query length, dtype, and device
+    from ``inputs_embeds``; it does not inspect embedding values. Under SP
+    (all_to_all, split_gather, ring), later PP stages receive a sequence shard, while
+    attention first gathers q/k/v back to the full sequence. Expanding one token as a
+    view gives mask construction the full query length without copying activation data.
+    """
+    if not sequence_is_sharded or hidden_states.shape[1] == query_length:
+        return hidden_states
+    return hidden_states[:, :1, :].expand(-1, query_length, -1)
+
+
+class _EagerMaskConfig:
+    """Read-through view of a model config under which ``create_causal_mask`` builds an eager mask.
+
+    Without flash attention, the policy replaces attention under SP with one that adds the mask to
+    its scores before an explicit softmax, so the mask must follow eager semantics (additive float)
+    whatever ``config._attn_implementation`` says: ``sdpa`` yields a boolean mask, ``flash_attention_2``
+    ``None`` or a 2D padding mask, ``flex_attention`` a ``BlockMask``. ``create_causal_mask`` picks the
+    mask format from ``config._attn_implementation`` only, so this view overrides that field and reads
+    every other attribute from the live config, which is neither copied nor modified.
+    """
+
+    _attn_implementation = "eager"
+
+    def __init__(self, config):
+        self._config = config
+
+    def __getattr__(self, name):
+        if name == "_config":  # not yet set (e.g. during copy / unpickling): avoid infinite recursion
+            raise AttributeError(name)
+        return getattr(self._config, name)
+
+
 class LlamaPipelineForwards:
     """
     This class serves as a micro library for forward function substitution of Llama models
@@ -148,9 +184,20 @@ class LlamaPipelineForwards:
         else:
             # `allow_is_causal_skip=False` is required: the attention below uses an explicit
             # softmax, so a skipped (`None`) mask would silently attend to every position.
+            causal_mask_inputs_embeds = _get_causal_mask_input_embeddings(
+                hidden_states,
+                seq_length,
+                sequence_is_sharded=(
+                    stage_manager is not None
+                    and not stage_manager.is_first_stage()
+                    and sp_mode in ("all_to_all", "split_gather", "ring")
+                ),
+            )
+            # Without flash attention, the policy replaces attention only under SP, with one that adds the
+            # mask to its scores; HF attention layers interpret the mask per `_attn_implementation`.
             attn_kwargs: torch.Tensor = create_causal_mask(
-                config=self.config,
-                inputs_embeds=hidden_states,
+                config=_EagerMaskConfig(self.config) if shard_config.enable_sequence_parallelism else self.config,
+                inputs_embeds=causal_mask_inputs_embeds,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
