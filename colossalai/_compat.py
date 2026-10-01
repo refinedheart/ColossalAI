@@ -37,6 +37,7 @@ Usage
     use_safetensors = kwargs.pop("use_safetensors", None if is_safetensors_available() else False)
 """
 
+from importlib import import_module
 from importlib.util import find_spec
 from inspect import signature
 from typing import Any, Callable, Dict, Optional
@@ -44,6 +45,7 @@ from urllib.parse import urlparse
 
 # Cache the result of `get_auth_kwarg_name` lazily to avoid inspecting the signature per load.
 _AUTH_KWARG_NAME: Optional[str] = None
+_IS_TRANSFORMERS_V5: Optional[bool] = None
 
 
 def get_no_init_weights() -> Callable[[], Any]:
@@ -179,3 +181,45 @@ def auth_kwargs(token: Any = None) -> Dict[str, Any]:
         Dict[str, Any]: Either ``{"token": token}`` or ``{"use_auth_token": token}``.
     """
     return {get_auth_kwarg_name(): token}
+
+
+def is_transformers_v5() -> bool:
+    r"""Return whether the installed transformers is v5 or later.
+
+    This is a deliberate exception to the feature-detection convention above. It picks a whole
+    implementation (see :func:`reexport_transformers_impl`), and the boundary between the two is
+    the v5 architecture change rather than any single symbol: probing e.g.
+    ``transformers.masking_utils`` would route late v4 releases, which already ship it, to the v5
+    implementation.
+
+    Returns:
+        bool: ``True`` when ``transformers.__version__`` has major version 5 or later.
+    """
+    global _IS_TRANSFORMERS_V5
+    if _IS_TRANSFORMERS_V5 is None:
+        import transformers
+
+        _IS_TRANSFORMERS_V5 = int(transformers.__version__.split(".", 1)[0]) >= 5
+    return _IS_TRANSFORMERS_V5
+
+
+def reexport_transformers_impl(namespace: Dict[str, Any], package: str, stem: str) -> None:
+    r"""Fill a module namespace with the implementation matching the transformers major version.
+
+    Model families whose v4 and v5 implementations diverge keep them in two sibling modules,
+    ``<stem>_tf4`` (the pinned v4, ``transformers==4.51.3``) and ``<stem>_tf5``. The public
+    module calls this helper so that existing imports of it keep working under both versions.
+    Every name except dunders is copied, private helpers included, because tests and policies
+    import some of them.
+
+    The names are references to the implementation module's objects, and its functions resolve
+    globals in that module. Patching (``mock.patch``, ``monkeypatch.setattr``) must therefore
+    target ``<stem>_tf4`` / ``<stem>_tf5``; patching the public module does not change behaviour.
+
+    Args:
+        namespace (Dict[str, Any]): ``globals()`` of the public module.
+        package (str): ``__package__`` of the public module.
+        stem (str): Module name prefix, e.g. ``"_llama"``.
+    """
+    impl = import_module(f"{package}.{stem}_tf5" if is_transformers_v5() else f"{package}.{stem}_tf4")
+    namespace.update({k: v for k, v in vars(impl).items() if not (k.startswith("__") and k.endswith("__"))})
