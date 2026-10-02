@@ -328,6 +328,17 @@ def check_forward_backward(model_fn, data_gen_fn, output_transform_fn, loss_fn, 
                     "precision": "fp32",
                     "initial_scale": 1,
                 },
+                {  # ring + PP; zero_stage 0 so that the weight gradients are checked
+                    "tp_size": 2,
+                    "pp_size": 2,
+                    "num_microbatches": 2,
+                    "enable_sequence_parallelism": True,
+                    "sequence_parallelism_mode": "ring",
+                    "use_lazy_init": False,
+                    "zero_stage": 0,
+                    "precision": "fp32",
+                    "initial_scale": 1,
+                },
             ]
             if is_transformers_v5()
             else []
