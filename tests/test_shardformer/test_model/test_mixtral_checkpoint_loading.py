@@ -10,7 +10,12 @@ from colossalai._compat import is_transformers_v5
 from colossalai.checkpoint_io.index_file import CheckpointIndexFile
 from colossalai.checkpoint_io.moe_checkpoint import MoECheckpointIO
 from colossalai.interface.model import ModelWrapper
-from colossalai.tensor.moe_tensor.api import is_moe_tensor, set_moe_tensor_ep_group
+from colossalai.tensor.moe_tensor.api import (
+    is_moe_tensor,
+    is_moe_tensor_ep_fused,
+    set_moe_tensor_ep_fused,
+    set_moe_tensor_ep_group,
+)
 from colossalai.testing.utils import spawn
 
 if not is_transformers_v5():
@@ -157,7 +162,10 @@ def _check_tp_ep_expert_checkpoint_gather(rank: int, world_size: int, port: int)
         _mark_fused_expert_tp_shard(experts.down_proj, "down_proj", tp_group, expert_start_idx, 4, 8)
         set_moe_tensor_ep_group(experts.gate_up_proj, ep_group)
         set_moe_tensor_ep_group(experts.down_proj, ep_group)
+        set_moe_tensor_ep_fused(experts.gate_up_proj)
+        set_moe_tensor_ep_fused(experts.down_proj)
         assert is_moe_tensor(experts.gate_up_proj) and is_moe_tensor(experts.down_proj)
+        assert is_moe_tensor_ep_fused(experts.gate_up_proj) and is_moe_tensor_ep_fused(experts.down_proj)
         assert dist.get_process_group_ranks(experts.gate_up_proj.ep_group) == dist.get_process_group_ranks(ep_group)
 
         saved_state = {}

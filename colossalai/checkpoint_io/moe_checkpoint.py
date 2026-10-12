@@ -34,7 +34,7 @@ from colossalai.checkpoint_io.utils import (
     sharded_optimizer_loading_epilogue,
 )
 from colossalai.interface import ModelWrapper, OptimizerWrapper
-from colossalai.tensor.moe_tensor.api import is_moe_tensor
+from colossalai.tensor.moe_tensor.api import is_moe_tensor, is_moe_tensor_ep_fused
 
 try:
     from torch.nn.modules.module import _EXTRA_STATE_KEY_SUFFIX
@@ -98,10 +98,11 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
                 continue
             # Gather tensor pieces when using tensor parallel.
             param_ = gather_distributed_param(param, keep_vars=False)
-            # A sharded checkpoint has one weight-map entry per parameter name. Gather
-            # EP-local expert slices to the EP root so every rank can reload the same
-            # full expert tensor and let the model's load hook select its local slice.
-            if is_moe_tensor(param):
+            # Fused experts have the same name on every EP rank, while a sharded checkpoint has one
+            # weight-map entry per name. Gather their EP-local slices to the EP root so every rank can
+            # reload the same full tensor and let the model's load hook select its local slice.
+            # Per-expert parameters already have distinct names on each EP rank and are not gathered.
+            if is_moe_tensor_ep_fused(param):
                 ep_group = param.ep_group
                 ep_size = dist.get_world_size(ep_group)
                 if ep_size > 1:
@@ -181,14 +182,15 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
             dist.barrier()
             return
 
-        # Experts are gathered across EP by `_model_sharder`; only the EP/TP/SP
-        # root for this pipeline stage writes checkpoint shards/index entries.
+        # Fused experts are gathered across EP by `_model_sharder`, so only ep_rank 0 writes them.
+        # Otherwise ep_rank 0 saves all the parameters and buffers, and other ep_ranks save their own experts.
+        gathers_fused_experts = self.ep_size > 1 and any(is_moe_tensor_ep_fused(p) for p in model.parameters())
 
         # Then collect the sharded parameters & buffers along tp_group.
-        # Only devices with ep_rank == tp_rank == sp_rank == 0 write model shards.
+        # Only devices with tp_rank == 0 are responsible for model saving.
         weights_name, save_index_file = get_model_base_filenames(prefix, use_safetensors)
         index_file = CheckpointIndexFile(checkpoint)
-        control_saving = self.ep_rank == 0 and self.tp_rank == 0 and self.sp_rank == 0
+        control_saving = self.tp_rank == 0 and self.sp_rank == 0 and (self.ep_rank == 0 or not gathers_fused_experts)
         pinned_state_dicts = None
         if self.pp_size == 1 and self.ep_size == 1 and use_async and control_saving:
             pinned_state_dicts = self.pinned_state_dicts.setdefault(hash(model), {})
@@ -229,8 +231,9 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
 
             dist.barrier()
         else:
-            # With PP or EP, the EP/TP/SP root for each pipeline stage writes shard files and a
-            # stage-local index under ./tmp_index_files/. The master later integrates those indexes.
+            # When pipeline or expert parallelism is used, each stage (and each EP rank that saves) produces
+            # its own shard files and index files under a temporary folder ./tmp_index_files/.
+            # After all the state_dicts have been saved, the master rank integrates all the index files into one final index file and deletes the tmp folder.
 
             final_index_file_path = copy.deepcopy(save_index_file)
             tmp_index_file_folder = os.path.join(checkpoint, "tmp_index_files")

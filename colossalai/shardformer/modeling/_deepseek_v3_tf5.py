@@ -20,7 +20,7 @@ from colossalai.moe._operation import (
 )
 from colossalai.pipeline.stage_manager import PipelineStageManager
 from colossalai.shardformer.layer.linear import ParallelModule
-from colossalai.tensor.moe_tensor.api import set_moe_tensor_ep_group
+from colossalai.tensor.moe_tensor.api import set_moe_tensor_ep_fused, set_moe_tensor_ep_group
 
 
 class EpDeepseekV3MoE(ParallelModule):
@@ -71,6 +71,7 @@ class EpDeepseekV3MoE(ParallelModule):
         # (the expert dimension) by `ep_group`.
         for p in self.experts.parameters():
             set_moe_tensor_ep_group(p, ep_group)
+            set_moe_tensor_ep_fused(p)
 
     @staticmethod
     def from_native_module(
