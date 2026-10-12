@@ -59,8 +59,10 @@ class EpDeepseekV3MoE(ParallelModule):
         experts = self.experts
         s = self.expert_start_idx
         n = self.num_experts_per_ep
-        experts.gate_up_proj = torch.nn.Parameter(experts.gate_up_proj[s : s + n].clone())
-        experts.down_proj = torch.nn.Parameter(experts.down_proj[s : s + n].clone())
+        # Swap the storage but keep the Parameter objects: optimizers are built from the unsharded model and
+        # the MoE plugin only prunes (never re-adds) optimizer params, so a new Parameter would drop out of training.
+        experts.gate_up_proj.data = experts.gate_up_proj.data[s : s + n].clone()
+        experts.down_proj.data = experts.down_proj.data[s : s + n].clone()
         experts.num_experts = n
 
         # setup moe_dp group
