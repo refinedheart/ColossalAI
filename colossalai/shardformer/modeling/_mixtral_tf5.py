@@ -104,6 +104,15 @@ def _slice_fused_expert_param(
     return tensor.contiguous()
 
 
+def _shard_param_in_place(param: torch.nn.Parameter, local: torch.Tensor) -> None:
+    """Swap a parameter's storage for its local shard while keeping the Parameter object.
+
+    Optimizers are built from the unsharded model and HybridParallel/MoE plugins only prune (never
+    re-add) optimizer params, so replacing the Parameter object would silently drop it from training.
+    """
+    param.data = local
+
+
 def _register_fused_expert_checkpoint_hook(
     experts: torch.nn.Module,
     expert_start_idx: int,
@@ -354,8 +363,8 @@ class EPMixtralSparseMoeBlock(ParallelModule):
         experts = self.experts
         s = self.expert_start_idx
         n = self.num_experts_per_ep
-        experts.gate_up_proj = torch.nn.Parameter(experts.gate_up_proj[s : s + n].clone())
-        experts.down_proj = torch.nn.Parameter(experts.down_proj[s : s + n].clone())
+        _shard_param_in_place(experts.gate_up_proj, experts.gate_up_proj.data[s : s + n].clone())
+        _shard_param_in_place(experts.down_proj, experts.down_proj.data[s : s + n].clone())
         experts.num_experts = n
 
         # setup moe_dp group
@@ -367,8 +376,8 @@ class EPMixtralSparseMoeBlock(ParallelModule):
         self.tp_size = tp_group.size()
         self.tp_rank = dist.get_rank(tp_group)
         if self.tp_size > 1:
-            gate_up_proj = experts.gate_up_proj
-            down_proj = experts.down_proj
+            gate_up_proj = experts.gate_up_proj.data
+            down_proj = experts.down_proj.data
             if gate_up_proj.shape[1] % 2 != 0:
                 raise ValueError("The fused gate_up_proj dimension must contain an even gate/up pair.")
             intermediate_size = gate_up_proj.shape[1] // 2
@@ -382,7 +391,8 @@ class EPMixtralSparseMoeBlock(ParallelModule):
             gate_up_partition_size = intermediate_size // self.tp_size
             down_partition_size = down_proj.shape[2] // self.tp_size
             tp_start = self.tp_rank * gate_up_partition_size
-            experts.gate_up_proj = torch.nn.Parameter(
+            _shard_param_in_place(
+                experts.gate_up_proj,
                 torch.cat(
                     (
                         gate_up_proj[:, tp_start : tp_start + gate_up_partition_size],
@@ -391,12 +401,12 @@ class EPMixtralSparseMoeBlock(ParallelModule):
                         ],
                     ),
                     dim=1,
-                ).clone()
+                ).clone(),
             )
             tp_start = self.tp_rank * down_partition_size
-            experts.down_proj = torch.nn.Parameter(down_proj[:, :, tp_start : tp_start + down_partition_size].clone())
+            _shard_param_in_place(experts.down_proj, down_proj[:, :, tp_start : tp_start + down_partition_size].clone())
 
-            # These manual slices are plain Parameters; checkpoint sharding needs explicit TP gather metadata.
+            # These manual slices are not DTensors; checkpoint sharding needs explicit TP gather metadata.
             _mark_fused_expert_tp_shard(experts.gate_up_proj, "gate_up_proj", tp_group, s, n, num_experts)
             _mark_fused_expert_tp_shard(experts.down_proj, "down_proj", tp_group, s, n, num_experts)
 
