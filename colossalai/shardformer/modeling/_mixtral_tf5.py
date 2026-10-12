@@ -41,7 +41,7 @@ from colossalai.shardformer.layer._operation import (
 from colossalai.shardformer.layer.linear import Linear1D_Col, LinearWithGradAccum, ParallelModule
 from colossalai.shardformer.shard import ShardConfig
 from colossalai.tensor.d_tensor import init_tensor_as_customization_distributed
-from colossalai.tensor.moe_tensor.api import set_moe_tensor_ep_group
+from colossalai.tensor.moe_tensor.api import set_moe_tensor_ep_fused, set_moe_tensor_ep_group
 
 # v4-era flag, read by `get_mixtral_flash_attention_forward` for a one-off warning. It is only
 # populated below when flash-attn is actually installed; default to "supported" so the reference
@@ -406,6 +406,7 @@ class EPMixtralSparseMoeBlock(ParallelModule):
         # (the expert dimension) by `ep_group`.
         for p in self.experts.parameters():
             set_moe_tensor_ep_group(p, ep_group)
+            set_moe_tensor_ep_fused(p)
 
     @staticmethod
     def from_native_module(
