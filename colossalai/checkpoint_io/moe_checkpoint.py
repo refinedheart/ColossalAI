@@ -323,6 +323,9 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
         for k, v in state_.items():
             if isinstance(v, torch.Tensor) and k != "step":
                 v = v.cuda()
+                # Only the root of the Zero group gets the complete state; the other ranks keep a flat shard.
+                # Ranks in one TP / EP group share their Zero group position, so they skip the gathers below together.
+                holds_full_state = True
 
                 # First gather Zero shards.
                 if use_zero and is_moe_param and moe_dp_size > 1:
@@ -334,6 +337,7 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
                         v = torch.stack(gather_tensor).view(-1)[: param.numel()].reshape_as(param)
                     else:
                         dist.gather(v, group=moe_dp_group, dst=dst)
+                        holds_full_state = False
 
                 elif use_zero and not is_moe_param and global_dp_size > 1:
                     dp_rank = dist.get_rank(global_dp_group)
@@ -344,6 +348,12 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
                         v = torch.stack(gather_tensor).view(-1)[: param.numel()].reshape_as(param)
                     else:
                         dist.gather(v, group=global_dp_group, dst=dst)
+                        holds_full_state = False
+
+                if not holds_full_state:
+                    # This rank does not save the state; a flat shard cannot be concatenated along a TP dimension.
+                    state_[k] = v.detach().clone().to(device)
+                    continue
 
                 # Then gather TP shards.
                 partition_dim = search_tp_partition_dim(current_shape, original_shape, tp_size)
