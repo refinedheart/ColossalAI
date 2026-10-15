@@ -56,7 +56,9 @@ def run_optimizer_checkpoint(config: Tuple):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     model, optimizer, *_ = booster.boost(model, optimizer)
 
-    seed_all(4321 + rank)
+    # Ranks of one TP group must see the same inputs; otherwise their replicated (non TP-sharded) parameters get
+    # different gradients and optimizer states, while a checkpoint keeps one copy per TP group.
+    seed_all(4321 + dist.get_rank(plugin.dp_group))
     inputs = torch.rand(2, NUM_TOKENS // 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
     loss = model(inputs_embeds=inputs).last_hidden_state.float().pow(2).mean()
     booster.backward(loss, optimizer)
@@ -96,6 +98,9 @@ def run_optimizer_checkpoint(config: Tuple):
         ("mixtral", 1, 4, 1),
         ("mixtral", 1, 2, 2),
         ("deepseek_v3", 1, 4, 1),
+        # ep_size 2 on 4 ranks gives moe_dp_size 2, so expert states are also sharded by Zero.
+        ("mixtral", 1, 2, 1),
+        ("deepseek_v3", 1, 2, 1),
     ],
 )
 def run_all(config: Tuple):
@@ -108,11 +113,6 @@ def check_optimizer_checkpoint(rank, world_size, port):
 
 
 @pytest.mark.dist
-@pytest.mark.xfail(
-    strict=True,
-    reason="Known bug (docs/32 W3-10): fused EP experts share one param_id across EP ranks and their "
-    "EP-local shape breaks search_tp_partition_dim, so sharded optimizer save/load cannot round-trip.",
-)
 @rerun_if_address_is_in_use()
 def test_moe_optimizer_checkpoint():
     spawn(check_optimizer_checkpoint, 4)

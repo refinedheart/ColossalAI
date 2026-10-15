@@ -34,6 +34,7 @@ from colossalai.checkpoint_io.utils import (
     sharded_optimizer_loading_epilogue,
 )
 from colossalai.interface import ModelWrapper, OptimizerWrapper
+from colossalai.tensor.d_tensor import is_customized_distributed_tensor
 from colossalai.tensor.moe_tensor.api import is_moe_tensor, is_moe_tensor_ep_fused
 
 try:
@@ -355,6 +356,13 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
                     state_[k] = v.detach().clone().to(device)
                     continue
 
+                if is_moe_tensor_ep_fused(param):
+                    # Fused experts are sharded along dim 0 by EP (and possibly along other dims by TP),
+                    # which `search_tp_partition_dim` cannot tell apart. Gather them like the model weights.
+                    v = MoECheckpointIO._gather_fused_expert_state(v, param)
+                    state_[k] = v.detach().clone().to(device)
+                    continue
+
                 # Then gather TP shards.
                 partition_dim = search_tp_partition_dim(current_shape, original_shape, tp_size)
                 if partition_dim is not None:
@@ -408,6 +416,9 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
             )
 
             if only_moe_param and not is_moe_tensor(working_param):
+                continue
+            # Fused expert states were gathered to the EP root, which saves them.
+            if is_moe_tensor_ep_fused(working_param) and dist.get_rank(working_param.ep_group) != 0:
                 continue
 
             block, block_size = state_dict_sharder.append_optim_state(param_id, state_)
@@ -665,12 +676,60 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
                 device=device,
                 inplace=True,
                 is_moe_param=is_moe_tensor(working_param),
+                working_param=working_param,
+                master_param=param,
             )
             optimizer.optim.state[param] = sharded_state
 
         sharded_optimizer_loading_epilogue(optimizer.optim)
         if self.verbose and self.coordinator.is_master():
             logging.info(f"The optimizer has been successfully loaded from sharded checkpoint: {ckpt_root_path}.")
+
+    @staticmethod
+    def _gather_fused_expert_state(state: torch.Tensor, param: torch.Tensor) -> torch.Tensor:
+        """
+        Gather the optimizer state of a fused expert parameter into the full ``[num_experts, ...]`` layout
+        on the EP root. ``state`` holds this rank's complete (Zero-gathered) state, possibly flattened.
+        """
+        state = state.reshape(-1)[: param.numel()].reshape(param.shape)
+        # Expert TP slices use the same gather function as the model checkpoint.
+        if is_customized_distributed_tensor(param):
+            state = param.gather_fn(state)
+        ep_group = param.ep_group
+        ep_size = dist.get_world_size(ep_group)
+        if ep_size > 1:
+            ep_rank = dist.get_rank(ep_group)
+            gathered = [torch.empty_like(state) for _ in range(ep_size)] if ep_rank == 0 else None
+            dist.gather(state.contiguous(), gather_list=gathered, dst=get_global_rank(ep_group, 0), group=ep_group)
+            if ep_rank == 0:
+                state = torch.cat(gathered, dim=0)
+        return state
+
+    def _shard_fused_expert_state(
+        self, state: torch.Tensor, param: torch.Tensor, master_param: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Slice this rank's part out of the full ``[num_experts, ...]`` optimizer state of a fused expert parameter.
+        """
+        if is_customized_distributed_tensor(param):
+            # Selects this rank's EP experts and TP columns, as when loading the model weights.
+            state = param.shard_fn(state)
+        else:
+            num_local_experts = param.shape[0]
+            start = dist.get_rank(param.ep_group) * num_local_experts
+            state = state[start : start + num_local_experts]
+
+        if self.use_zero and self.moe_dp_size > 1:
+            # LowLevelZeRO pads by global dp size for now.
+            padding_size = (self.global_dp_size - state.numel() % self.global_dp_size) % self.global_dp_size
+            state = state.flatten()
+            if padding_size > 0:
+                state = torch.nn.functional.pad(state, [0, padding_size])
+            state = state.split(state.numel() // self.moe_dp_size, dim=0)[self.moe_dp_rank]
+        elif master_param is not None and state.numel() == master_param.numel():
+            # Zero keeps flattened master parameters.
+            state = state.reshape(master_param.shape)
+        return state
 
     def shard_from_complete_optimizer_state(
         self,
@@ -680,6 +739,8 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
         device: torch.device,
         inplace: bool,
         is_moe_param: bool,
+        working_param: Optional[torch.Tensor] = None,
+        master_param: Optional[torch.Tensor] = None,
     ) -> OrderedDict:
         """
         With complete optimizer states of a specific parameter loaded from checkpoint,
@@ -691,6 +752,9 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
             original_shape (torch.Size): The size of parameter before sharding.
             device (torch.device): The destination device of loaded optimizer states.
             inplace (bool): If set to True, will update the values of argument 'state' in place. Else will make a copy of state.
+            working_param (torch.Tensor, optional): The model parameter; needed to shard fused expert states.
+            master_param (torch.Tensor, optional): The parameter the optimizer keeps states for (the fp32 master
+                parameter when using Zero); fused expert states are reshaped to it.
 
         Returns:
             OrderedDict: The sharded optimizer state of the given parameter.
@@ -698,6 +762,11 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
         state_ = state if inplace else copy.deepcopy(state)
         for k, v in state_.items():
             if isinstance(v, torch.Tensor) and k != "step":
+                if working_param is not None and is_moe_tensor_ep_fused(working_param):
+                    v = self._shard_fused_expert_state(v, working_param, master_param)
+                    state_[k] = v.detach().clone().to(device)
+                    continue
+
                 # Shard state along tensor parallel group.
                 partition_dim = search_tp_partition_dim(current_shape, original_shape, self.tp_size)
                 if partition_dim is not None:
