@@ -57,7 +57,8 @@ def run_grad_norm(ep_size: int, moe_only: bool):
     )
     torch_model = MixtralModel(config).to(dtype).cuda()
     for name, param in torch_model.named_parameters():
-        param.requires_grad_(not moe_only or "block_sparse_moe" in name)
+        # transformers v5 renamed `block_sparse_moe` to `mlp`
+        param.requires_grad_(not moe_only or "block_sparse_moe" in name or ".mlp." in name)
 
     # single-GPU reference: same weights in fp32 on the concatenation of every rank's batch (= global mean loss)
     single_model = deepcopy(torch_model).float()

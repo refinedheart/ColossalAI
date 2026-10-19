@@ -22,15 +22,8 @@ from transformers.utils import is_flash_attn_2_available, logging
 from transformers.utils.output_capturing import capture_outputs
 
 from colossalai.lazy import LazyInitContext
-from colossalai.moe._operation import (
-    DPGradScalerIn,
-    DPGradScalerOut,
-    EPGradScalerIn,
-    EPGradScalerOut,
-    all_to_all_uneven,
-)
+from colossalai.moe._operation import EPGradScalerIn, EPGradScalerOut, all_to_all_uneven
 from colossalai.pipeline.stage_manager import PipelineStageManager
-from colossalai.quantization.fp8 import all_reduce_fp8
 from colossalai.shardformer.layer._operation import (
     all_to_all_comm,
     gather_forward_split_backward,
@@ -480,17 +473,6 @@ class EPMixtralSparseMoeBlock(ParallelModule):
 
         dist.all_to_all_single(output_split_sizes, input_split_sizes, group=self.ep_group)
 
-        with torch.no_grad():
-            activate_experts = output_split_sizes[: self.num_experts_per_ep].clone()
-            for i in range(1, self.ep_size):
-                activate_experts += output_split_sizes[i * self.num_experts_per_ep : (i + 1) * self.num_experts_per_ep]
-            activate_experts = (activate_experts > 0).float()
-
-        if self.fp8_communication:
-            all_reduce_fp8(activate_experts, group=self.moe_dp_group)
-        else:
-            dist.all_reduce(activate_experts, group=self.moe_dp_group)
-
         input_split_list = input_split_sizes.view(self.ep_size, self.num_experts_per_ep).sum(dim=-1).tolist()
         output_split_list = output_split_sizes.view(self.ep_size, self.num_experts_per_ep).sum(dim=-1).tolist()
 
@@ -506,9 +488,7 @@ class EPMixtralSparseMoeBlock(ParallelModule):
         if output_states.size(0) > 0:
             if self.num_experts_per_ep == 1:
                 # no need to split
-                output_states = DPGradScalerIn.apply(output_states, self.moe_dp_size, activate_experts[0])
                 output_states = self._expert_forward(output_states, 0)
-                output_states = DPGradScalerOut.apply(output_states, self.moe_dp_size, activate_experts[0])
             else:
                 output_states_splits = output_states.split(output_split_sizes.tolist())
                 output_states_list = []
@@ -516,9 +496,7 @@ class EPMixtralSparseMoeBlock(ParallelModule):
                     if split_states.size(0) == 0:
                         continue
                     expert_idx = i % self.num_experts_per_ep
-                    split_states = DPGradScalerIn.apply(split_states, self.moe_dp_size, activate_experts[expert_idx])
                     split_states = self._expert_forward(split_states, expert_idx)
-                    split_states = DPGradScalerOut.apply(split_states, self.moe_dp_size, activate_experts[expert_idx])
                     output_states_list.append(split_states)
                 output_states = torch.cat(output_states_list)
 
