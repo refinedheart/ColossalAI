@@ -110,7 +110,9 @@ def test_llama_attention_slices_reserved_cache_mask_column():
 
 @pytest.mark.parametrize("mode", ["split_gather", "ring", "all_to_all"])
 def test_llama_pipeline_mask_uses_full_sequence(mode, monkeypatch):
-    from colossalai.shardformer.modeling import llama as module
+    # patch the module that implements the forward: colossalai.shardformer.modeling.llama only re-exports the
+    # implementation for the installed transformers version
+    module = importlib.import_module(LlamaPipelineForwards.__module__)
 
     model = LlamaModel(
         LlamaConfig(
