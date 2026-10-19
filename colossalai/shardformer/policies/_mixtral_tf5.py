@@ -50,6 +50,10 @@ class MixtralPolicy(Policy):
         sp_size = self.shard_config.sequence_parallel_size or None
         sp_group = self.shard_config.sequence_parallel_process_group or None
         sp_partial_derived = sp_mode in ["split_gather", "ring"]
+        if sp_partial_derived:
+            # These modes keep the sequence split across the tp group, so the ranks of a tp group dispatch
+            # different tokens to the experts, while the tp-sharded experts reduce their outputs over that group.
+            raise NotImplementedError(f"Mixtral does not support sequence parallelism mode {sp_mode} yet.")
         tp_size = self.shard_config.tensor_parallel_size
         use_zbv = self.pipeline_stage_manager is not None and self.pipeline_stage_manager.use_zbv
 

@@ -950,7 +950,6 @@ def get_mixtral_flash_attention_forward(shard_config, sp_mode=None, sp_size=None
         # so a plain SP run would hit an `AttributeError` on `self.num_heads` -- hence the fallback.
         num_heads = getattr(self, "num_heads", None) or self.config.num_attention_heads
         num_key_value_heads = getattr(self, "num_key_value_heads", None) or self.config.num_key_value_heads
-        hidden_size = getattr(self, "hidden_size", None) or self.config.hidden_size
 
         # sp: modify sp_len when sequence parallel mode is ring
         if sp_mode in ["split_gather", "ring"]:
@@ -1048,7 +1047,7 @@ def get_mixtral_flash_attention_forward(shard_config, sp_mode=None, sp_size=None
                 attn_output, sp_group, scatter_dim=1, gather_dim=2, fp8_communication=shard_config.fp8_communication
             )  # (1, 4, 256)
         else:
-            attn_output = attn_output.reshape(bsz, q_len, hidden_size)
+            attn_output = attn_output.reshape(bsz, q_len, num_heads * self.head_dim)
 
         attn_output = self.o_proj(attn_output)
 
@@ -1132,7 +1131,7 @@ def get_mixtral_flash_attention_model_forward(shard_config, sp_mode=None, sp_siz
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if attention_mask is not None and self._attn_implementation == "flash_attention_2" and use_cache:
+        if attention_mask is not None and self.config._attn_implementation == "flash_attention_2" and use_cache:
             is_padding_right = attention_mask[:, -1].sum().item() != batch_size
             if is_padding_right:
                 raise ValueError(
