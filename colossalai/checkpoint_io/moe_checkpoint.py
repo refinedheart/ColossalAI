@@ -720,8 +720,8 @@ class MoECheckpointIO(HybridParallelCheckpointIO):
             state = state[start : start + num_local_experts]
 
         if self.use_zero and self.moe_dp_size > 1:
-            # LowLevelZeRO pads by global dp size for now.
-            padding_size = (self.global_dp_size - state.numel() % self.global_dp_size) % self.global_dp_size
+            # LowLevelZeRO pads each param by the size of the group it is sharded over
+            padding_size = (self.moe_dp_size - state.numel() % self.moe_dp_size) % self.moe_dp_size
             state = state.flatten()
             if padding_size > 0:
                 state = torch.nn.functional.pad(state, [0, padding_size])

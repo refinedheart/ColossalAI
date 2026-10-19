@@ -17,7 +17,7 @@ from colossalai.booster.booster import Booster
 from colossalai.booster.plugin.moe_hybrid_parallel_plugin import MoeHybridParallelPlugin
 from colossalai.testing import parameterize, rerun_if_address_is_in_use, spawn
 from colossalai.testing.random import seed_all
-from tests.test_shardformer.test_model.test_moe_optimizer_coverage import HIDDEN, NUM_TOKENS, _build
+from tests.test_shardformer.test_model.test_moe_optimizer_coverage import NUM_TOKENS, _build
 
 
 def _state_snapshot(optimizer):
@@ -53,13 +53,14 @@ def run_optimizer_checkpoint(config: Tuple):
     booster = Booster(plugin=plugin)
     seed_all(1234)
     model = _build(model_name).to(torch.bfloat16).cuda()
+    hidden_size = model.config.hidden_size
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     model, optimizer, *_ = booster.boost(model, optimizer)
 
     # Ranks of one TP group must see the same inputs; otherwise their replicated (non TP-sharded) parameters get
     # different gradients and optimizer states, while a checkpoint keeps one copy per TP group.
     seed_all(4321 + dist.get_rank(plugin.dp_group))
-    inputs = torch.rand(2, NUM_TOKENS // 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    inputs = torch.rand(2, NUM_TOKENS // 2, hidden_size, device="cuda", dtype=torch.bfloat16)
     loss = model(inputs_embeds=inputs).last_hidden_state.float().pow(2).mean()
     booster.backward(loss, optimizer)
     optimizer.step()
@@ -101,6 +102,8 @@ def run_optimizer_checkpoint(config: Tuple):
         # ep_size 2 on 4 ranks gives moe_dp_size 2, so expert states are also sharded by Zero.
         ("mixtral", 1, 2, 1),
         ("deepseek_v3", 1, 2, 1),
+        # expert sizes whose Zero padding differs between moe_dp_size and the global dp size
+        ("mixtral_odd", 1, 2, 1),
     ],
 )
 def run_all(config: Tuple):

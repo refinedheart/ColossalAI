@@ -35,6 +35,22 @@ def _build(model_name: str):
             attn_implementation="eager",
         )
         return MixtralModel(config)
+    if model_name == "mixtral_odd":
+        # One expert per rank under ep_size 2 with odd sizes: the local fused experts have 1 x 34 x 33 = 1122 and
+        # 1 x 33 x 17 = 561 elements, so padding them for moe_dp_size 2 (0 and 1) differs from padding them for the
+        # global dp size 4 (2 and 3).
+        config = MixtralConfig(
+            hidden_size=33,
+            intermediate_size=17,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            num_local_experts=2,
+            num_experts_per_tok=2,
+            attn_implementation="eager",
+        )
+        return MixtralModel(config)
     config = DeepseekV3Config(
         vocab_size=128,
         hidden_size=HIDDEN,
